@@ -87,15 +87,14 @@
       Open links in same tab
     </label>
     <div style="margin-top:10px;padding-top:10px;border-top:1px solid #444;">
-      <label style="display:flex;align-items:center;gap:8px;color:#ccc;cursor:pointer;">
-        <input type="checkbox" id="setting-site-lock-enabled">
-        Require site password
-      </label>
-      <label style="display:flex;align-items:center;gap:8px;color:#ccc;margin-top:8px;">
-        Ask again every
+      <div style="display:flex;align-items:center;gap:8px;color:#ccc;">
+        <label for="setting-site-lock-enabled" style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+          <input type="checkbox" id="setting-site-lock-enabled">
+          Require site password every
+        </label>
         <input type="number" id="setting-site-lock-days" min="1" max="30" step="1" style="width:56px;box-sizing:border-box;">
         days
-      </label>
+      </div>
     </div>
     <div style="margin-top:12px;padding-top:10px;border-top:1px solid #444;display:flex;flex-direction:column;gap:8px;">
       <strong style="color:#fff;font-size:12px;">Auto Fit Size Settings</strong>

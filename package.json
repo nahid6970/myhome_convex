@@ -6,7 +6,7 @@
     "dev": "npx convex dev",
     "deploy": "npx convex deploy",
     "test": "echo \"Open test-connection.html in browser\"",
-    "deploy:pages": "wrangler pages deploy ./deploy --project-name=myhome-dashboard"
+    "deploy:pages": "node scripts/prepare-pages.mjs && wrangler pages deploy ./deploy --project-name=myhome-dashboard"
   },
   "devDependencies": {
     "convex": "^1.16.0",
