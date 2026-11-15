@@ -34,7 +34,7 @@ myhome-convex/
 │   ├── schema.ts           # Database schema
 │   ├── functions.ts        # Queries + mutations
 │   └── actions.ts          # Server-side actions (title fetch, YouTube oEmbed)
-├── chrome-extension/       # Browser extension for adding links
+├── ../extension/myhome_ext/ # Separate browser extension project for adding links
 ├── md/                     # Documentation
 │   ├── RECENT.md           # Session history
 │   ├── PROBLEMS_AND_FIXES.md
@@ -90,7 +90,8 @@ Defined as `window.formatPainter` IIFE in inline `<script>` at bottom of `index.
 - #[[file:md/PROBLEMS_AND_FIXES.md]] — Bug tracker
 - #[[file:md/FEATURES.md]] — Feature specs
 - #[[file:md/UI_UX.md]] — UI/UX guidelines
-- #[[file:chrome-extension/README.md]] — Extension setup
+- [Extension project](../extension/myhome_ext/) — Browser extension source
+- [Extension setup](../extension/myhome_ext/README.md) — Installation and configuration
 - #[[file:README.md]] — Setup instructions
 - #[[file:QUICKSTART.md]] — Quick start
 

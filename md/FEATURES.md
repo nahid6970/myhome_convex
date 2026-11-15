@@ -163,8 +163,8 @@
 ## Chrome Extension
 **Status:** ✅ Complete
 **Description:** Add links via browser right-click context menu or extension popup.
-**Files Involved:** `chrome-extension/`
-**Usage:** See `chrome-extension/README.md`
+**Files Involved:** [myhome_ext](../../extension/myhome_ext/), maintained alongside this project.
+**Usage:** See the [extension README](../../extension/myhome_ext/README.md).
 
 ---
 

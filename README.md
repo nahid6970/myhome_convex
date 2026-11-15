@@ -62,7 +62,8 @@
 ✅ **Chrome Extension:**
   - Add links via right-click context menu
   - Extension popup for quick link addition
-  - See `chrome-extension/README.md` for setup
+  - Extension project: [myhome_ext](../extension/myhome_ext/)
+  - Setup instructions: [extension README](../extension/myhome_ext/README.md)
 
 ## Production Deployment
 
@@ -74,7 +75,7 @@
 
 2. **Update app.js with prod URL**
 
-3. **Update Chrome extension files (`background.js` and `popup.js`) with prod URL**
+3. **Update the extension files** in [myhome_ext](../extension/myhome_ext/) (`background.js` and `popup.js`) with the prod URL
 
 4. **Deploy frontend to GitHub Pages or any static host**
 
@@ -84,7 +85,7 @@
 - Only changes to `convex/` folder count as deployments
 - HTML/CSS/JS changes don't count
 - Database tables created automatically on first insert
-- Chrome extension can be moved to any folder location
+- The extension is maintained separately at `../extension/myhome_ext/` and can be moved to another folder; update these links if its location changes.
 
 ## Known Issues
 
