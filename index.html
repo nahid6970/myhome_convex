@@ -6,8 +6,26 @@
   <link rel="shortcut icon" href="https://cdn-icons-png.flaticon.com/512/4021/4021539.png" type="image/x-icon">
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script>
+    (function() {
+      try {
+        var settings = JSON.parse(localStorage.getItem('myhome-settings') || '{}');
+        var days = Math.max(1, Math.min(30, Number(settings.siteLockDays) || 3));
+        var lastUnlockedAt = Number(localStorage.getItem('myhome-site-last-unlocked-at')) || 0;
+        var stillUnlocked = lastUnlockedAt > 0 && Date.now() - lastUnlockedAt < days * 24 * 60 * 60 * 1000;
+        if (settings.siteLockEnabled !== false && !stillUnlocked) {
+          document.documentElement.classList.add('site-lock-required');
+        }
+      } catch (error) {
+        document.documentElement.classList.add('site-lock-required');
+      }
+    })();
+  </script>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/nerd-fonts-web@3.0.0/dist/nerd-fonts-generated.min.css">
   <style>
+    #site-lock-screen { display: none; }
+    html.site-lock-required #site-lock-screen { display: flex !important; }
+
     /* Ensure nerd font icons display properly */
     .nf,
     [class*="nf-"] {
@@ -25,7 +43,7 @@
 </head>
 
 <body>
-  <div id="site-lock-screen" style="position:fixed;inset:0;z-index:100000;background:#1a1a1a;display:flex;align-items:center;justify-content:center;padding:20px;">
+  <div id="site-lock-screen" style="position:fixed;inset:0;z-index:100000;background:#1a1a1a;align-items:center;justify-content:center;padding:20px;">
     <form id="site-lock-form" style="width:min(360px,100%);background:#2d2d2d;border:1px solid #e53935;border-radius:8px;padding:24px;box-shadow:0 8px 32px rgba(0,0,0,.6);">
       <h1 style="font-size:20px;margin-bottom:8px;">MyHome is locked</h1>
       <p style="color:#bbb;font-size:13px;margin-bottom:16px;">Enter the site password to continue.</p>
