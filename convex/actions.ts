@@ -52,7 +52,7 @@ export const fetchPageTitle = action({
           response = await fetch(targetUrl);
         }
       } catch (e) {
-        console.error('Fetch attempt failed:', e);
+        console.warn(`Metadata request failed for ${domain}; retrying without browser headers.`);
         // Last ditch effort: try without headers if the whole fetch threw
         response = await fetch(targetUrl);
       }
@@ -60,7 +60,7 @@ export const fetchPageTitle = action({
       let html = '';
       if (!response.ok) {
         const errorBody = await response.text().catch(() => 'No body');
-        console.error(`Fetch failed with ${response.status}: ${errorBody.substring(0, 200)}`);
+        console.warn(`Metadata unavailable for ${domain} (HTTP ${response.status}); using fallback metadata.`);
         if ((domain.includes('youtube.com') || domain.includes('youtu.be')) && (oembedTitle || oembedThumbnail)) {
           return {
             title: oembedTitle || title || domain,
@@ -72,7 +72,12 @@ export const fetchPageTitle = action({
         
         // Don't throw for Facebook, allow fallback URL parsing to proceed
         if (!domain.includes('facebook.com')) {
-          throw new Error(`HTTP ${response.status}`);
+          return {
+            title: oembedTitle || domain,
+            domain: domain,
+            channelIcon: oembedThumbnail,
+            youtubeChannelId: null
+          };
         }
         html = errorBody; // Use error body just in case it has some info
       } else {
@@ -270,7 +275,7 @@ export const fetchPageTitle = action({
         youtubeChannelId: youtubeChannelId
       };
     } catch (error) {
-      console.error('Fetch error:', error);
+      console.warn(`Metadata fetch failed for ${domain}; using fallback metadata.`);
       if (domain.includes('youtube.com') || domain.includes('youtu.be')) {
         return {
           title: oembedTitle || domain,
