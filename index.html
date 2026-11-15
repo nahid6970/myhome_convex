@@ -1227,6 +1227,38 @@
         }
       }
 
+      function saveAutoFitDefaultsForNewItems() {
+        var minPercent = normalizeAutoFitPercent(document.getElementById('setting-auto-fit-scale-min').value, 70);
+        var maxPercent = normalizeAutoFitPercent(document.getElementById('setting-auto-fit-scale-max').value, 135);
+        var defaultPercent = normalizeAutoFitPercent(document.getElementById('setting-auto-fit-scale-default').value, 100);
+        if (maxPercent <= minPercent) maxPercent = minPercent + 1;
+        defaultPercent = Math.min(maxPercent, Math.max(minPercent, defaultPercent));
+
+        document.getElementById('setting-auto-fit-scale-min').value = minPercent;
+        document.getElementById('setting-auto-fit-scale-max').value = maxPercent;
+        document.getElementById('setting-auto-fit-scale-default').value = defaultPercent;
+
+        var s = loadSettings();
+        s.autoFitScaleMinPercent = minPercent;
+        s.autoFitScaleMaxPercent = maxPercent;
+        s.autoFitScaleDefaultPercent = defaultPercent;
+        saveSettings(s);
+
+        if (window.refreshAutoFitScaleControls) {
+          window.refreshAutoFitScaleControls({ resetAddToDefault: true });
+        }
+        if (window.convexMutation) {
+          window.convexMutation('functions:upsertAppSettings', {
+            key: 'global',
+            autoFitScaleMinPercent: minPercent,
+            autoFitScaleMaxPercent: maxPercent,
+            autoFitScaleDefaultPercent: defaultPercent,
+          }).catch(function(error) {
+            console.warn('Could not sync Auto Fit defaults:', error);
+          });
+        }
+      }
+
       window.applySettings = async function() {
         var s = loadSettings();
         var hideNames = document.getElementById('setting-hide-group-names').checked;
@@ -1279,6 +1311,9 @@
         if (window.convexClient) {
           await syncSettingsFromServer();
         }
+        ['setting-auto-fit-scale-min', 'setting-auto-fit-scale-default', 'setting-auto-fit-scale-max'].forEach(function(id) {
+          document.getElementById(id).addEventListener('change', saveAutoFitDefaultsForNewItems);
+        });
       });
       document.addEventListener('convexClientReady', function() {
         syncSettingsFromServer();

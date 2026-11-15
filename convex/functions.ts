@@ -131,7 +131,16 @@ export const addLink = mutation({
     thumbnail_refresh_enabled: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
-    await ctx.db.insert("links", args);
+    let data = args;
+    if (!args.is_separator && args.li_auto_fit_scale === undefined) {
+      const settings = await ctx.db
+        .query("app_settings")
+        .filter((q) => q.eq(q.field("key"), "global"))
+        .first();
+      const defaultPercent = settings?.autoFitScaleDefaultPercent ?? 100;
+      data = { ...args, li_auto_fit_scale: Math.max(1, defaultPercent) / 100 };
+    }
+    await ctx.db.insert("links", data);
   },
 });
 
