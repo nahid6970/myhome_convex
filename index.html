@@ -10,9 +10,10 @@
     (function() {
       try {
         var settings = JSON.parse(localStorage.getItem('myhome-settings') || '{}');
-        var days = Math.max(1, Math.min(30, Number(settings.siteLockDays) || 3));
+        var savedDays = Number(settings.siteLockDays);
+        var days = Number.isFinite(savedDays) ? Math.max(0, Math.min(30, Math.floor(savedDays))) : 3;
         var lastUnlockedAt = Number(localStorage.getItem('myhome-site-last-unlocked-at')) || 0;
-        var stillUnlocked = lastUnlockedAt > 0 && Date.now() - lastUnlockedAt < days * 24 * 60 * 60 * 1000;
+        var stillUnlocked = days > 0 && lastUnlockedAt > 0 && Date.now() - lastUnlockedAt < days * 24 * 60 * 60 * 1000;
         if (settings.siteLockEnabled !== false && !stillUnlocked) {
           document.documentElement.classList.add('site-lock-required');
         }
@@ -63,9 +64,10 @@
       var settings = {};
       try { settings = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}'); } catch (e) {}
       var enabled = settings.siteLockEnabled !== false;
-      var days = Math.max(1, Math.min(30, Number(settings.siteLockDays) || 3));
+      var savedDays = Number(settings.siteLockDays);
+      var days = Number.isFinite(savedDays) ? Math.max(0, Math.min(30, Math.floor(savedDays))) : 3;
       var lastUnlockedAt = Number(localStorage.getItem(UNLOCKED_AT_KEY)) || 0;
-      var stillUnlocked = lastUnlockedAt > 0 && Date.now() - lastUnlockedAt < days * 24 * 60 * 60 * 1000;
+      var stillUnlocked = days > 0 && lastUnlockedAt > 0 && Date.now() - lastUnlockedAt < days * 24 * 60 * 60 * 1000;
       if (!enabled || stillUnlocked) screen.style.display = 'none';
       else setTimeout(function() { input.focus(); }, 0);
 
@@ -77,6 +79,7 @@
           return;
         }
         localStorage.setItem(UNLOCKED_AT_KEY, String(Date.now()));
+        document.documentElement.classList.remove('site-lock-required');
         screen.style.display = 'none';
       });
     })();
@@ -110,7 +113,7 @@
           <input type="checkbox" id="setting-site-lock-enabled">
           Require site password every
         </label>
-        <input type="number" id="setting-site-lock-days" min="1" max="30" step="1" style="width:56px;box-sizing:border-box;">
+        <input type="number" id="setting-site-lock-days" min="0" max="30" step="1" style="width:56px;box-sizing:border-box;">
         days
       </div>
     </div>
@@ -136,6 +139,11 @@
     <button id="refresh-enabled-thumbnails-btn" onclick="window.refreshEnabledThumbnails()" style="background:#00bcd4;color:#000;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;margin-top:12px;width:100%;font-weight:bold;font-size:12px;transition:all 0.2s;">
       Refresh Enabled Thumbnails 🔄
     </button>
+    <div style="display:flex;justify-content:flex-end;margin-top:12px;">
+      <button id="settings-ok-btn" onclick="window.applySettings().then(function(){ document.getElementById('settings-panel').classList.add('hidden'); })" style="background:#4caf50;color:#000;border:none;padding:7px 16px;border-radius:4px;cursor:pointer;font-weight:bold;font-size:12px;">
+        OK
+      </button>
+    </div>
   </div>
 
   <div class="flex-container2">
@@ -1197,7 +1205,8 @@
         document.getElementById('setting-hide-group-names').checked = !!s.hideGroupNames;
         document.getElementById('setting-open-same-tab').checked = !!s.openSameTab;
         document.getElementById('setting-site-lock-enabled').checked = s.siteLockEnabled !== false;
-        document.getElementById('setting-site-lock-days').value = Math.max(1, Math.min(30, Number(s.siteLockDays) || 3));
+        var savedSiteLockDays = Number(s.siteLockDays);
+        document.getElementById('setting-site-lock-days').value = Number.isFinite(savedSiteLockDays) ? Math.max(0, Math.min(30, Math.round(savedSiteLockDays))) : 3;
         document.body.classList.toggle('hide-group-names', !!s.hideGroupNames);
       }
 
@@ -1229,7 +1238,9 @@
         s.hideGroupNames = hideNames;
         s.openSameTab = document.getElementById('setting-open-same-tab').checked;
         s.siteLockEnabled = document.getElementById('setting-site-lock-enabled').checked;
-        s.siteLockDays = Math.max(1, Math.min(30, normalizeAutoFitPercent(document.getElementById('setting-site-lock-days').value, 3)));
+        var siteLockDaysInput = document.getElementById('setting-site-lock-days').value.trim();
+        var parsedSiteLockDays = siteLockDaysInput === '' ? NaN : Number(siteLockDaysInput);
+        s.siteLockDays = Number.isFinite(parsedSiteLockDays) ? Math.max(0, Math.min(30, Math.round(parsedSiteLockDays))) : 3;
         s.autoFitScaleMinPercent = minPercent;
         s.autoFitScaleMaxPercent = maxPercent;
         s.autoFitScaleDefaultPercent = defaultPercent;
