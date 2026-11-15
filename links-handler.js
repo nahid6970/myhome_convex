@@ -2338,7 +2338,7 @@ function openEditLinkPopup(link, index) {
   document.getElementById('edit-link-width').value = link.width || '';
   document.getElementById('edit-link-height').value = link.height || '';
   document.getElementById('edit-link-color').value = link.color || 'transparent';
-  document.getElementById('edit-link-background-color').value = link.background_color || '';
+  document.getElementById('edit-link-background-color').value = link.background_color || 'transparent';
   document.getElementById('edit-link-font-family').value = link.font_family || '';
   document.getElementById('edit-link-font-size').value = link.font_size || '';
   document.getElementById('edit-link-li-width').value = link.li_width || '';
