@@ -133,6 +133,10 @@ export const addLink = mutation({
   handler: async (ctx, args) => {
     const data = { ...args };
     if (!data.is_separator) {
+      if (!data.color) data.color = "transparent";
+      if (!data.background_color) data.background_color = "transparent";
+      if (!data.li_bg_color) data.li_bg_color = "transparent";
+      if (!data.li_border_color) data.li_border_color = "transparent";
       if (data.li_auto_fit === undefined) {
         data.li_auto_fit = true;
       }
