@@ -5,9 +5,11 @@
   "scripts": {
     "dev": "npx convex dev",
     "deploy": "npx convex deploy",
-    "test": "echo \"Open test-connection.html in browser\""
+    "test": "echo \"Open test-connection.html in browser\"",
+    "deploy:pages": "wrangler pages deploy ./deploy --project-name=myhome-dashboard"
   },
   "devDependencies": {
-    "convex": "^1.16.0"
+    "convex": "^1.16.0",
+    "wrangler": "^4.162.0"
   }
 }

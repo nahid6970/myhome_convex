@@ -1,0 +1,3446 @@
+console.log('🔍 links-handler.js loaded!');
+
+let links = [];
+let draggedElement = null;
+let duplicateInfoById = new Map();
+let currentReminderDraft = null;
+let reminderRefreshTimer = null;
+const LINKS_CACHE_KEY = 'myhome-links-cache-v1';
+let lastLinksSignature = '';
+const DEFAULT_AUTO_FIT_SCALE = 1.0;
+const DEFAULT_AUTO_FIT_SCALE_SETTINGS = Object.freeze({
+  minPercent: 70,
+  maxPercent: 135,
+  defaultPercent: 100,
+});
+
+// Initialize edit mode
+if (typeof window.editMode === 'undefined') {
+  window.editMode = false;
+}
+
+// F1 key toggle edit mode
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'F1') {
+    e.preventDefault();
+    window.editMode = !window.editMode;
+    console.log('🔵 Edit mode toggled:', window.editMode);
+
+    const container = document.querySelector('.flex-container2');
+    if (container) {
+      container.classList.toggle('edit-mode', window.editMode);
+    }
+
+    // Dispatch event for other handlers
+    document.dispatchEvent(new CustomEvent('editModeChanged', {
+      detail: { isEditMode: window.editMode }
+    }));
+
+    // Re-render to show/hide edit buttons
+    renderLinks();
+    if (typeof loadSidebarButtons === 'function') {
+      loadSidebarButtons();
+    }
+
+    // Show notification
+    window.showNotification(
+      window.editMode ? 'Edit mode enabled (F1 to disable)' : 'Edit mode disabled',
+      'success'
+    );
+  }
+});
+
+// Initialize Convex client if not already initialized
+if (!window.convexClient) {
+  console.log('🔵 Initializing Convex client in links-handler.js...');
+
+  // Load ConvexHttpClient dynamically
+  import('https://esm.sh/convex@1.16.0/browser').then(module => {
+    const { ConvexHttpClient } = module;
+    window.convexClient = new ConvexHttpClient("https://lovable-wildcat-595.convex.cloud");
+    console.log('✅ Convex client initialized!');
+    document.dispatchEvent(new CustomEvent('convexClientReady'));
+
+    // Now load links
+    if (typeof loadLinks === 'function') {
+      loadLinks();
+    }
+  }).catch(error => {
+    console.error('❌ Failed to load Convex client:', error);
+  });
+}
+
+// Helper functions for Convex API calls
+if (!window.convexQuery) {
+  window.convexQuery = async (functionName, args = {}) => {
+    if (!window.convexClient) {
+      throw new Error('Convex client not initialized');
+    }
+    return await window.convexClient.query(functionName, args);
+  };
+}
+
+if (!window.convexMutation) {
+  window.convexMutation = async (functionName, args = {}) => {
+    if (!window.convexClient) {
+      throw new Error('Convex client not initialized');
+    }
+    return await window.convexClient.mutation(functionName, args);
+  };
+}
+
+if (!window.convexAction) {
+  window.convexAction = async (functionName, args = {}) => {
+    if (!window.convexClient) {
+      throw new Error('Convex client not initialized');
+    }
+    return await window.convexClient.action(functionName, args);
+  };
+}
+
+// Show notification helper
+if (!window.showNotification) {
+  window.showNotification = (message, type = 'success') => {
+    const notif = document.getElementById('copy-notification');
+    if (notif) {
+      notif.textContent = message;
+      notif.className = `copy-notification ${type} show`;
+      setTimeout(() => notif.classList.remove('show'), 2000);
+    } else {
+      console.log(`[${type.toUpperCase()}] ${message}`);
+    }
+  };
+}
+
+function buildLinksSignature(linkItems) {
+  try {
+    return JSON.stringify(linkItems);
+  } catch (error) {
+    console.warn('Could not build links signature:', error);
+    return String(Date.now());
+  }
+}
+
+function applyLinksData(linkItems, options = {}) {
+  const sortedLinks = [...linkItems].sort((a, b) => (a._creationTime || 0) - (b._creationTime || 0));
+  const nextSignature = buildLinksSignature(sortedLinks);
+  const changed = nextSignature !== lastLinksSignature;
+
+  links = sortedLinks;
+  duplicateInfoById = buildDuplicateInfoMap(links);
+  ensureReminderRefreshTimer();
+
+  if (changed || options.forceRender) {
+    lastLinksSignature = nextSignature;
+    renderLinks();
+    refreshOpenPopup();
+  }
+
+  if (options.persistCache) {
+    try {
+      localStorage.setItem(LINKS_CACHE_KEY, JSON.stringify({
+        savedAt: Date.now(),
+        links: sortedLinks,
+      }));
+    } catch (error) {
+      console.warn('Could not save links cache:', error);
+    }
+  }
+
+  return changed;
+}
+
+function loadLinksFromCache() {
+  try {
+    const rawCache = localStorage.getItem(LINKS_CACHE_KEY);
+    if (!rawCache) return false;
+
+    const parsedCache = JSON.parse(rawCache);
+    if (!parsedCache || !Array.isArray(parsedCache.links)) return false;
+
+    applyLinksData(parsedCache.links, { forceRender: true });
+    console.log(`⚡ Loaded ${parsedCache.links.length} cached links`);
+    return true;
+  } catch (error) {
+    console.warn('Could not load links cache:', error);
+    return false;
+  }
+}
+
+async function refreshMissingYouTubeMetadata() {
+  if (window._youtubeMetadataRefreshStarted) return;
+  window._youtubeMetadataRefreshStarted = true;
+
+  const candidates = links.filter((link) => {
+    if (link.is_separator) return false;
+    const urls = getLinkUrls(link);
+    const isYouTubeLink = urls.some((url) => /youtube\.com|youtu\.be/i.test(url));
+    if (!isYouTubeLink) return false;
+
+    const hasCustomImage = !!link.img_src && !/google\.com\/s2\/favicons/i.test(link.img_src);
+    return !hasCustomImage;
+  });
+
+  if (!candidates.length) return;
+
+  const CONCURRENCY = 3;
+  for (let i = 0; i < candidates.length; i += CONCURRENCY) {
+    await Promise.all(candidates.slice(i, i + CONCURRENCY).map(async (link) => {
+      const sourceUrl = getLinkUrls(link)[0];
+      if (!sourceUrl) return;
+
+      try {
+        const result = await window.convexAction("actions:fetchPageTitle", { url: sourceUrl });
+        const updates = {};
+
+        if (result.youtubeChannelId && result.youtubeChannelId !== link.youtube_channel_id) {
+          updates.youtube_channel_id = result.youtubeChannelId;
+        }
+
+        if (result.channelIcon && result.channelIcon !== link.img_src) {
+          updates.img_src = result.channelIcon;
+        }
+
+        if (!Object.keys(updates).length) return;
+
+        if (updates.img_src) {
+          await window.convexMutation("functions:updateLinkImage", {
+            id: link._id,
+            img_src: updates.img_src,
+          });
+        }
+
+        if (updates.youtube_channel_id || updates.youtube_last_video_id) {
+          await window.convexMutation("functions:updateYouTubeStatus", {
+            id: link._id,
+            table: "links",
+            youtube_channel_id: updates.youtube_channel_id,
+            youtube_last_video_id: updates.youtube_last_video_id,
+          });
+        }
+
+        Object.assign(link, updates);
+      } catch (error) {
+        console.warn('Could not refresh YouTube metadata:', error);
+      }
+    }));
+  }
+
+  renderLinks();
+}
+
+function getLinkUrls(link) {
+  const values = [];
+  if (Array.isArray(link.urls)) values.push(...link.urls);
+  if (link.url) values.push(link.url);
+  return [...new Set(values.filter(Boolean))];
+}
+
+function formatClickTrackingBadge(lastClickedAt) {
+  const timestamp = Number(lastClickedAt || 0);
+  if (!timestamp) {
+    return {
+      text: '0',
+      title: 'Never clicked yet',
+    };
+  }
+
+  const hours = Math.floor((Date.now() - timestamp) / (60 * 60 * 1000));
+  const safeHours = Math.max(0, hours);
+  return {
+    text: `${safeHours}`,
+    title: `Last clicked ${safeHours} hour${safeHours === 1 ? '' : 's'} ago`,
+  };
+}
+
+function formatTimeAgo(timestamp) {
+  if (!timestamp) return '';
+  const diffMs = Date.now() - timestamp;
+  if (diffMs < 0) return 'just now';
+  const totalMinutes = Math.floor(diffMs / 60000);
+  if (totalMinutes < 1) return 'just now';
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+
+  if (days > 0) {
+    return hours > 0 ? `${days}d ${hours}h ago` : `${days}d ago`;
+  }
+  if (hours > 0) {
+    return minutes > 0 ? `${hours}h ${minutes}m ago` : `${hours}h ago`;
+  }
+  return `${minutes}m ago`;
+}
+
+function normalizeUrl(rawUrl) {
+  if (!rawUrl) return '';
+
+  try {
+    const url = new URL(rawUrl.trim());
+    const protocol = url.protocol.toLowerCase();
+    const host = url.hostname.toLowerCase();
+    const port = url.port ? `:${url.port}` : '';
+    const pathname = (url.pathname || '/').replace(/\/+$/, '') || '/';
+    const search = url.search || '';
+    return `${protocol}//${host}${port}${pathname}${search}`;
+  } catch (error) {
+    return rawUrl.trim().replace(/\/+$/, '').toLowerCase();
+  }
+}
+
+function buildDuplicateInfoMap(allLinks) {
+  const urlGroups = new Map();
+
+  allLinks.forEach((link) => {
+    if (link.is_separator) return;
+
+    getLinkUrls(link)
+      .map(normalizeUrl)
+      .filter(Boolean)
+      .forEach((normalizedUrl) => {
+        if (!urlGroups.has(normalizedUrl)) {
+          urlGroups.set(normalizedUrl, []);
+        }
+        urlGroups.get(normalizedUrl).push(link);
+      });
+  });
+
+  const infoMap = new Map();
+  urlGroups.forEach((matchedLinks) => {
+    if (matchedLinks.length < 2) return;
+
+    matchedLinks.forEach((link) => {
+      const otherGroups = matchedLinks
+        .filter(other => other._id !== link._id)
+        .map(other => other.group || 'Ungrouped');
+      const uniqueGroups = [...new Set(otherGroups)];
+
+      infoMap.set(link._id, {
+        count: matchedLinks.length,
+        groups: uniqueGroups
+      });
+    });
+  });
+
+  return infoMap;
+}
+
+function ensureReminderRefreshTimer() {
+  if (reminderRefreshTimer) return;
+
+  reminderRefreshTimer = window.setInterval(() => {
+    if (document.hidden) return;
+    renderLinks();
+    refreshOpenPopup();
+    updateEditReminderSummary();
+    updateReminderStatus();
+  }, 30000);
+}
+
+function getReminderDraftFromLink(link) {
+  return {
+    reminder_enabled: Boolean(link.reminder_enabled),
+    reminder_mode: link.reminder_mode || 'interval',
+    reminder_frequency: link.reminder_frequency || 'one_time',
+    reminder_interval_days: typeof link.reminder_interval_days === 'number' ? link.reminder_interval_days : null,
+    reminder_datetime: link.reminder_datetime || '',
+    reminder_next_trigger_at: typeof link.reminder_next_trigger_at === 'number' ? link.reminder_next_trigger_at : null,
+    reminder_last_triggered_at: typeof link.reminder_last_triggered_at === 'number' ? link.reminder_last_triggered_at : null,
+  };
+}
+
+function computeReminderNextTrigger(reminder) {
+  if (!reminder.reminder_enabled) return null;
+
+  if (reminder.reminder_mode === 'datetime') {
+    if (!reminder.reminder_datetime) return null;
+    const timestamp = new Date(reminder.reminder_datetime).getTime();
+    return Number.isFinite(timestamp) ? timestamp : null;
+  }
+
+  const days = Number(reminder.reminder_interval_days);
+  if (!Number.isFinite(days) || days <= 0) return null;
+
+  const baseTime = reminder.reminder_last_triggered_at || Date.now();
+  return baseTime + days * 24 * 60 * 60 * 1000;
+}
+
+function parseReminderIntervalDays(rawValue) {
+  if (rawValue == null || rawValue === '') return null;
+  if (typeof rawValue === 'number') {
+    return Number.isFinite(rawValue) && rawValue > 0 ? rawValue : null;
+  }
+
+  const value = String(rawValue).trim().toLowerCase();
+  if (!value) return null;
+
+  if (/^\d+(\.\d+)?$/.test(value)) {
+    const numericDays = Number(value);
+    return Number.isFinite(numericDays) && numericDays > 0 ? numericDays : null;
+  }
+
+  const matches = [...value.matchAll(/(\d+(?:\.\d+)?)\s*([dhm])/g)];
+  const normalized = value.replace(/(\d+(?:\.\d+)?)\s*([dhm])/g, '').trim();
+  if (!matches.length || normalized) return null;
+
+  let totalMinutes = 0;
+  for (const [, amountRaw, unit] of matches) {
+    const amount = Number(amountRaw);
+    if (!Number.isFinite(amount) || amount < 0) return null;
+
+    if (unit === 'd') totalMinutes += amount * 24 * 60;
+    if (unit === 'h') totalMinutes += amount * 60;
+    if (unit === 'm') totalMinutes += amount;
+  }
+
+  return totalMinutes > 0 ? totalMinutes / (24 * 60) : null;
+}
+
+function formatReminderIntervalInput(daysValue) {
+  if (!Number.isFinite(daysValue) || daysValue <= 0) return '';
+
+  let remainingMinutes = Math.round(daysValue * 24 * 60);
+  const days = Math.floor(remainingMinutes / (24 * 60));
+  remainingMinutes -= days * 24 * 60;
+  const hours = Math.floor(remainingMinutes / 60);
+  remainingMinutes -= hours * 60;
+  const minutes = remainingMinutes;
+
+  const parts = [];
+  if (days) parts.push(`${days}d`);
+  if (hours) parts.push(`${hours}h`);
+  if (minutes) parts.push(`${minutes}m`);
+  return parts.join(' ') || `${daysValue}d`;
+}
+
+function formatReminderIntervalLabel(daysValue) {
+  return formatReminderIntervalInput(daysValue) || 'custom interval';
+}
+
+function sanitizeReminderDraft(reminder) {
+  const draft = {
+    reminder_enabled: Boolean(reminder?.reminder_enabled),
+    reminder_mode: reminder?.reminder_mode === 'datetime' ? 'datetime' : 'interval',
+    reminder_frequency: reminder?.reminder_frequency === 'continuous' ? 'continuous' : 'one_time',
+    reminder_interval_days: parseReminderIntervalDays(reminder?.reminder_interval_days),
+    reminder_datetime: reminder?.reminder_datetime || '',
+    reminder_next_trigger_at: reminder?.reminder_next_trigger_at ?? null,
+    reminder_last_triggered_at: reminder?.reminder_last_triggered_at ?? null,
+  };
+
+  if (!draft.reminder_enabled) {
+    return {
+      reminder_enabled: false,
+      reminder_mode: 'interval',
+      reminder_frequency: 'one_time',
+      reminder_interval_days: null,
+      reminder_datetime: '',
+      reminder_next_trigger_at: null,
+      reminder_last_triggered_at: null,
+    };
+  }
+
+  if (draft.reminder_mode === 'datetime') {
+    draft.reminder_frequency = 'one_time';
+    draft.reminder_interval_days = null;
+  } else if (!draft.reminder_last_triggered_at) {
+    draft.reminder_last_triggered_at = Date.now();
+  }
+
+  draft.reminder_next_trigger_at = computeReminderNextTrigger(draft);
+  return draft;
+}
+
+function getReminderMeta(link, now = Date.now()) {
+  if (!link.reminder_enabled || !link.reminder_next_trigger_at) {
+    return { active: false };
+  }
+
+  const timeLeft = link.reminder_next_trigger_at - now;
+  const due = timeLeft <= 0;
+
+  return {
+    active: true,
+    due,
+    timeLeft,
+    countdown: due ? 'Due' : formatDuration(timeLeft),
+    nextDateLabel: formatReminderDate(link.reminder_next_trigger_at),
+    tooltip: due
+      ? `Reminder due since ${formatReminderDate(link.reminder_next_trigger_at)}`
+      : `Reminder due ${formatReminderDate(link.reminder_next_trigger_at)}`,
+  };
+}
+
+function formatDuration(milliseconds) {
+  const totalMinutes = Math.max(1, Math.floor(milliseconds / 60000));
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+
+  if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+  if (hours > 0) return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+  return `${minutes}m`;
+}
+
+function formatReminderDate(timestamp) {
+  if (!timestamp) return 'Unknown';
+  return new Date(timestamp).toLocaleString();
+}
+
+function getDefaultReminderDateTimeValue() {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}T23:59`;
+}
+
+function prefillReminderDateTimeIfEmpty() {
+  const dateTimeInput = document.getElementById('reminder-datetime');
+  if (!dateTimeInput || dateTimeInput.value) return;
+  dateTimeInput.value = getDefaultReminderDateTimeValue();
+}
+
+function formatReminderSummary(reminder) {
+  const meta = getReminderMeta(reminder);
+  if (!reminder.reminder_enabled || !meta.active) return 'No reminder set.';
+
+  if (reminder.reminder_mode === 'datetime') {
+    return meta.due
+      ? `Specific reminder is due now.`
+      : `Specific reminder in ${meta.countdown} (${meta.nextDateLabel}).`;
+  }
+
+  const intervalLabel = formatReminderIntervalLabel(reminder.reminder_interval_days);
+  const repeatLabel = reminder.reminder_frequency === 'continuous' ? 'repeats' : 'one time';
+  return meta.due
+    ? `Every ${intervalLabel} reminder is due now (${repeatLabel}).`
+    : `Every ${intervalLabel}, ${repeatLabel}, due in ${meta.countdown}.`;
+}
+
+function updateReminderModeUI() {
+  const enabled = document.getElementById('reminder-enabled')?.checked;
+  const mode = document.getElementById('reminder-mode')?.value || 'interval';
+  const intervalFields = document.getElementById('reminder-interval-fields');
+  const datetimeFields = document.getElementById('reminder-datetime-fields');
+  const frequency = document.getElementById('reminder-frequency');
+
+  if (intervalFields) intervalFields.classList.toggle('hidden', !enabled || mode !== 'interval');
+  if (datetimeFields) datetimeFields.classList.toggle('hidden', !enabled || mode !== 'datetime');
+
+  if (frequency) {
+    frequency.disabled = !enabled || mode === 'datetime';
+    if (mode === 'datetime') {
+      frequency.value = 'one_time';
+      prefillReminderDateTimeIfEmpty();
+    }
+  }
+}
+
+function populateReminderPopup(reminder) {
+  const safeReminder = sanitizeReminderDraft(reminder || {});
+  document.getElementById('reminder-enabled').checked = safeReminder.reminder_enabled;
+  document.getElementById('reminder-mode').value = safeReminder.reminder_mode;
+  document.getElementById('reminder-frequency').value = safeReminder.reminder_frequency;
+  document.getElementById('reminder-interval-days').value = formatReminderIntervalInput(safeReminder.reminder_interval_days);
+  document.getElementById('reminder-datetime').value = safeReminder.reminder_datetime
+    ? safeReminder.reminder_datetime.slice(0, 16)
+    : '';
+
+  currentReminderDraft = safeReminder;
+  updateReminderModeUI();
+  updateReminderStatus();
+}
+
+function updateReminderStatus() {
+  const statusEl = document.getElementById('reminder-status');
+  if (!statusEl) return;
+
+  const pendingDraft = collectReminderFormDraft();
+  statusEl.textContent = formatReminderSummary(pendingDraft);
+}
+
+function collectReminderFormDraft() {
+  return sanitizeReminderDraft({
+    reminder_enabled: document.getElementById('reminder-enabled')?.checked,
+    reminder_mode: document.getElementById('reminder-mode')?.value,
+    reminder_frequency: document.getElementById('reminder-frequency')?.value,
+    reminder_interval_days: document.getElementById('reminder-interval-days')?.value,
+    reminder_datetime: document.getElementById('reminder-datetime')?.value,
+    reminder_last_triggered_at: currentReminderDraft?.reminder_last_triggered_at,
+  });
+}
+
+function updateEditReminderSummary() {
+  const summaryEl = document.getElementById('edit-link-reminder-summary');
+  if (!summaryEl) return;
+  summaryEl.textContent = formatReminderSummary(currentReminderDraft || {});
+}
+
+function validateReminderDraft(reminder) {
+  if (!reminder.reminder_enabled) return { valid: true };
+
+  if (reminder.reminder_mode === 'datetime') {
+    if (!reminder.reminder_datetime || !reminder.reminder_next_trigger_at) {
+      return { valid: false, message: 'Choose a valid reminder date and time.' };
+    }
+    return { valid: true };
+  }
+
+  if (!Number.isFinite(reminder.reminder_interval_days) || reminder.reminder_interval_days <= 0) {
+    return { valid: false, message: 'Enter a valid duration like 7d 8h 99m, 25d, 66h, or 35m.' };
+  }
+
+  if (!reminder.reminder_next_trigger_at) {
+    return { valid: false, message: 'Could not calculate the next reminder time.' };
+  }
+
+  return { valid: true };
+}
+
+function getOptionalReminderDraft(reminder) {
+  const sanitized = sanitizeReminderDraft(reminder || {});
+  const validation = validateReminderDraft(sanitized);
+
+  if (validation.valid) {
+    return { reminder: sanitized, skipped: false };
+  }
+
+  return {
+    reminder: sanitizeReminderDraft({ reminder_enabled: false }),
+    skipped: true
+  };
+}
+
+function compactObject(value) {
+  return Object.fromEntries(
+    Object.entries(value).filter(([, fieldValue]) => fieldValue !== null && fieldValue !== undefined)
+  );
+}
+
+function parseAutoFitScale(value) {
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_AUTO_FIT_SCALE;
+}
+
+function formatAutoFitScale(scale) {
+  return String(Math.round(scale * 100));
+}
+
+function parseAutoFitScalePercent(value, fallback) {
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? Math.max(1, Math.round(parsed)) : fallback;
+}
+
+function getAutoFitScaleSettings() {
+  let settings = {};
+  try {
+    settings = JSON.parse(localStorage.getItem('myhome-settings') || '{}');
+  } catch (error) {
+    console.warn('Could not load auto-fit scale settings:', error);
+  }
+
+  let minPercent = parseAutoFitScalePercent(settings.autoFitScaleMinPercent, DEFAULT_AUTO_FIT_SCALE_SETTINGS.minPercent);
+  let maxPercent = parseAutoFitScalePercent(settings.autoFitScaleMaxPercent, DEFAULT_AUTO_FIT_SCALE_SETTINGS.maxPercent);
+  let defaultPercent = parseAutoFitScalePercent(settings.autoFitScaleDefaultPercent, DEFAULT_AUTO_FIT_SCALE_SETTINGS.defaultPercent);
+
+  if (maxPercent <= minPercent) {
+    maxPercent = minPercent + 1;
+  }
+
+  defaultPercent = Math.min(maxPercent, Math.max(minPercent, defaultPercent));
+
+  return {
+    minPercent,
+    maxPercent,
+    defaultPercent,
+    minScale: minPercent / 100,
+    maxScale: maxPercent / 100,
+    defaultScale: defaultPercent / 100,
+  };
+}
+
+window.getAutoFitScaleSettings = getAutoFitScaleSettings;
+
+function updateAutoFitScaleVisual(range, display, scale) {
+  const min = Number.parseFloat(range.min);
+  const max = Number.parseFloat(range.max);
+  const ratio = Number.isFinite(min) && Number.isFinite(max) && max > min
+    ? (scale - min) / (max - min)
+    : 0;
+  const progress = Math.min(100, Math.max(0, ratio * 100));
+  range.style.setProperty('--auto-fit-scale-progress', `${progress}%`);
+  const slider = range.closest('.auto-fit-scale-slider');
+  const fill = slider ? slider.querySelector('.auto-fit-scale-track-fill') : null;
+  if (fill) {
+    fill.style.width = `${progress}%`;
+  }
+  display.textContent = `${formatAutoFitScale(scale)}%`;
+}
+
+function setAutoFitScaleInputVisibility(prefix) {
+  const row = document.getElementById(`${prefix}-li-auto-fit-scale-input`);
+  const checkbox = document.getElementById(`${prefix}-li-auto-fit`);
+  if (!row || !checkbox) return;
+  const expanded = row.dataset.expanded === 'true';
+  row.style.display = checkbox.checked && expanded ? 'flex' : 'none';
+}
+
+function toggleAutoFitScaleInput(prefix) {
+  const row = document.getElementById(`${prefix}-li-auto-fit-scale-input`);
+  const checkbox = document.getElementById(`${prefix}-li-auto-fit`);
+  if (!row || !checkbox) return;
+  row.dataset.expanded = row.dataset.expanded === 'true' ? 'false' : 'true';
+  setAutoFitScaleInputVisibility(prefix);
+}
+
+window.toggleAutoFitScaleInput = toggleAutoFitScaleInput;
+
+function applyAutoFitScaleSettingsToControl(prefix, options = {}) {
+  const row = document.getElementById(`${prefix}-li-auto-fit-scale-input`);
+  const range = document.getElementById(`${prefix}-li-auto-fit-scale`);
+  const display = document.getElementById(`${prefix}-li-auto-fit-scale-value`);
+  const checkbox = document.getElementById(`${prefix}-li-auto-fit`);
+  if (!row || !range || !display || !checkbox) return;
+
+  const settings = getAutoFitScaleSettings();
+  const clampToSettings = (scale) => Math.min(settings.maxScale, Math.max(settings.minScale, scale));
+  const useDefault = options.resetToDefault || (prefix === 'link' && !range.dataset.autoFitTouched);
+  const currentScale = useDefault ? settings.defaultScale : clampToSettings(parseAutoFitScale(range.value));
+
+  range.min = settings.minScale.toFixed(2);
+  range.max = settings.maxScale.toFixed(2);
+  range.step = '0.05';
+  range.defaultValue = settings.defaultScale.toFixed(2);
+  range.value = currentScale.toFixed(2);
+  if (useDefault) {
+    range.dataset.autoFitTouched = '';
+  }
+  updateAutoFitScaleVisual(range, display, currentScale);
+  if (typeof row.dataset.expanded === 'undefined') {
+    row.dataset.expanded = 'false';
+  }
+  setAutoFitScaleInputVisibility(prefix);
+}
+
+function scaleCssSize(sizeValue, scale, fallbackValue) {
+  const source = (sizeValue || fallbackValue || '').toString().trim();
+  if (!source || !Number.isFinite(scale) || scale <= 0 || scale === 1) {
+    return source;
+  }
+
+  const match = source.match(/^(-?\d*\.?\d+)(px|rem|em|pt|%)?$/i);
+  if (!match) return source;
+
+  const numeric = Number.parseFloat(match[1]);
+  if (!Number.isFinite(numeric)) return source;
+
+  const unit = match[2] || 'px';
+  const scaled = Math.max(0, Math.round(numeric * scale * 100) / 100);
+  return `${scaled}${unit}`;
+}
+
+function getAutoFitScaleValue(prefix) {
+  const scaleInput = document.getElementById(`${prefix}-li-auto-fit-scale`);
+  return scaleInput ? parseAutoFitScale(scaleInput.value) : DEFAULT_AUTO_FIT_SCALE;
+}
+
+function syncAutoFitScaleControls(prefix) {
+  const row = document.getElementById(`${prefix}-li-auto-fit-scale-input`);
+  const range = document.getElementById(`${prefix}-li-auto-fit-scale`);
+  const checkbox = document.getElementById(`${prefix}-li-auto-fit`);
+  if (!row || !range || !checkbox || row.dataset.bound === 'true') return;
+
+  const updateFromRange = () => {
+    range.dataset.autoFitTouched = 'true';
+    const settings = getAutoFitScaleSettings();
+    const scale = Math.min(settings.maxScale, Math.max(settings.minScale, parseAutoFitScale(range.value)));
+    range.value = scale.toFixed(2);
+    updateAutoFitScaleVisual(range, document.getElementById(`${prefix}-li-auto-fit-scale-value`), scale);
+  };
+  const updateVisibility = () => {
+    if (!checkbox.checked) {
+      row.dataset.expanded = 'false';
+    }
+    setAutoFitScaleInputVisibility(prefix);
+  };
+
+  range.addEventListener('input', updateFromRange);
+  checkbox.addEventListener('change', updateVisibility);
+
+  applyAutoFitScaleSettingsToControl(prefix, { resetToDefault: prefix === 'link' });
+  updateVisibility();
+  row.dataset.bound = 'true';
+}
+
+function refreshAutoFitScaleControls(options = {}) {
+  ['link', 'edit-link'].forEach((prefix) => {
+    applyAutoFitScaleSettingsToControl(prefix, {
+      resetToDefault: prefix === 'link' && options.resetAddToDefault,
+    });
+  });
+}
+
+window.refreshAutoFitScaleControls = refreshAutoFitScaleControls;
+
+function openReminderPopup() {
+  populateReminderPopup(currentReminderDraft || {});
+  document.getElementById('reminder-popup').classList.remove('hidden');
+}
+
+function resetReminderFromPopup() {
+  const draft = collectReminderFormDraft();
+  if (!draft.reminder_enabled) {
+    currentReminderDraft = draft;
+    updateReminderStatus();
+    updateEditReminderSummary();
+    return;
+  }
+
+  if (draft.reminder_mode === 'interval' && draft.reminder_frequency === 'continuous' && draft.reminder_interval_days) {
+    const resetTime = Date.now();
+    currentReminderDraft = sanitizeReminderDraft({
+      ...draft,
+      reminder_last_triggered_at: resetTime,
+    });
+  } else if (draft.reminder_mode === 'datetime') {
+    currentReminderDraft = sanitizeReminderDraft({
+      ...draft,
+      reminder_enabled: false,
+    });
+  } else {
+    currentReminderDraft = sanitizeReminderDraft({
+      ...draft,
+      reminder_enabled: false,
+    });
+  }
+
+  populateReminderPopup(currentReminderDraft);
+  updateEditReminderSummary();
+}
+
+// Load links from Convex
+async function loadLinks() {
+  try {
+    // Wait for convexQuery to be available
+    if (!window.convexQuery) {
+      console.warn('Waiting for Convex client to initialize...');
+      await new Promise(resolve => {
+        const checkInterval = setInterval(() => {
+          if (window.convexQuery) {
+            clearInterval(checkInterval);
+            resolve();
+          }
+        }, 100);
+      });
+    }
+
+    const data = await window.convexQuery("functions:getLinks");
+    const changed = applyLinksData(data, { persistCache: true, forceRender: !links.length });
+    if (changed) {
+      console.log('✅ Links refreshed from Convex');
+    }
+
+    // Trigger YouTube check periodically (first run after 3s, then every 30 minutes)
+    if (!window._youtubeChecked && window.convexClient) {
+      window._youtubeChecked = true;
+      setTimeout(checkAllYouTubeUpdates, 3000);
+      setInterval(checkAllYouTubeUpdates, 30 * 60 * 1000);
+    }
+
+    if (!window._clickTrackingRefreshTimer) {
+      window._clickTrackingRefreshTimer = setInterval(() => {
+        if (links.some((link) => link.click_tracking_enabled)) {
+          renderLinks();
+        }
+      }, 10 * 60 * 1000);
+    }
+
+    if (!window._youtubeMetadataRefreshQueued) {
+      window._youtubeMetadataRefreshQueued = true;
+      setTimeout(() => {
+        refreshMissingYouTubeMetadata().catch((error) => {
+          console.warn('YouTube metadata refresh failed:', error);
+        });
+      }, 1500);
+    }
+  } catch (error) {
+    console.error('Error loading links:', error);
+  }
+}
+// Refresh popup if it's open
+function refreshOpenPopup() {
+  const popup = document.getElementById('group_type_box-popup');
+  if (!popup || popup.classList.contains('hidden')) return;
+
+  const popupTitle = popup.querySelector('h3');
+  if (!popupTitle || !popupTitle.dataset.groupName) return;
+
+  const groupName = popupTitle.dataset.groupName;
+  const groupLinks = links.filter(l => (l.group || 'Ungrouped') === groupName);
+  const firstLink = groupLinks[0] || {};
+
+  const popupBox = popup.querySelector('.group_type_box');
+  const popupContent = popup.querySelector('.popup-content-inner');
+  popupContent.innerHTML = '';
+
+  // Update popup title and name
+  const displayName = firstLink.top_name || groupName;
+  renderDisplayName(popupTitle, displayName);
+
+  // Apply group styling to popup
+  if (firstLink.popup_bg_color) popupBox.style.backgroundColor = firstLink.popup_bg_color;
+  if (firstLink.popup_text_color) popupBox.style.color = firstLink.popup_text_color;
+  if (firstLink.popup_border_color) popupBox.style.borderColor = firstLink.popup_border_color;
+  if (firstLink.popup_border_radius) popupBox.style.borderRadius = firstLink.popup_border_radius;
+
+  groupLinks.forEach((link) => {
+    // Add invisible line break before item if needed
+    if (link.start_new_line) {
+      const lineBreak = document.createElement('div');
+      lineBreak.className = 'item-line-break';
+      popupContent.appendChild(lineBreak);
+    }
+    const linkIndex = links.findIndex(l => l._id === link._id);
+    const clonedItem = createLinkItem(link, linkIndex);
+    popupContent.appendChild(clonedItem);
+  });
+}
+
+loadLinksFromCache();
+
+function getUniqueGroups() {
+  const groups = [...new Set(links.map(link => (link.group || 'Ungrouped').trim()).filter(Boolean))];
+  groups.sort((a, b) => a.localeCompare(b));
+  return groups;
+}
+
+function buildGroupPickerItems(input, query = '') {
+  const normalizedQuery = query.trim().toLowerCase();
+  const groups = getUniqueGroups();
+  const filteredGroups = normalizedQuery
+    ? groups.filter(group => group.toLowerCase().includes(normalizedQuery))
+    : groups;
+
+  if (!filteredGroups.length) {
+    return [{
+      label: 'No matching groups',
+      className: 'context-menu-empty',
+      disabled: true
+    }];
+  }
+
+  return filteredGroups.map(group => ({
+    label: group,
+    icon: '📁',
+    action: () => {
+      input.value = group;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  }));
+}
+
+function showGroupPicker(input, triggerEvent) {
+  if (!input || typeof window.showContextMenu !== 'function') return;
+
+  const items = buildGroupPickerItems(input, input.value);
+  window.showContextMenu(triggerEvent || input, items, {
+    layout: 'list',
+    anchorElement: input
+  });
+}
+
+// Show group picker context menu
+window.toggleGroupPicker = function (event, inputId) {
+  const input = document.getElementById(inputId);
+  if (!input) return;
+
+  showGroupPicker(input, event);
+};
+
+document.addEventListener('focusin', (event) => {
+  const input = event.target;
+  if (!input || !input.matches || !input.matches('.group-input-container input')) return;
+  showGroupPicker(input, input);
+});
+
+document.addEventListener('input', (event) => {
+  const input = event.target;
+  if (!input || !input.matches || !input.matches('.group-input-container input')) return;
+  showGroupPicker(input, input);
+});
+
+// Render links
+function renderLinks() {
+  const container = document.getElementById('links-container');
+
+  if (!container) {
+    console.error('❌ links-container not found!');
+    return;
+  }
+
+  container.innerHTML = '';
+
+  const grouped = {};
+  const collapsible = {};
+  const separators = [];
+
+  links.forEach((link, index) => {
+    if (link.hidden && !window.editMode) return;
+
+    // Handle separators - store them separately
+    if (link.is_separator) {
+      separators.push({ link, index });
+      return;
+    }
+
+    const group = link.group || 'Ungrouped';
+    if (!grouped[group]) grouped[group] = [];
+    grouped[group].push({ link, index });
+
+    if (link.collapsible) collapsible[group] = true;
+  });
+
+  // Sort groups by group_order
+  const sortedGroupNames = Object.keys(grouped).sort((a, b) => {
+    const aOrder = grouped[a][0].link.group_order ?? 999;
+    const bOrder = grouped[b][0].link.group_order ?? 999;
+    if (aOrder !== bOrder) return aOrder - bOrder;
+    return a.localeCompare(b);
+  });
+
+  if (Object.keys(collapsible).length > 0) {
+    const topContainer = document.createElement('div');
+    topContainer.className = 'group_type_top-container';
+
+    sortedGroupNames.filter(name => collapsible[name]).forEach(groupName => {
+      const groupDiv = createCollapsibleGroup(groupName, grouped[groupName]);
+
+      // Add invisible line break before group if needed
+      const firstLink = grouped[groupName][0].link;
+      if (firstLink.group_start_new_line) {
+        const lineBreak = document.createElement('div');
+        lineBreak.className = 'group-line-break';
+        topContainer.appendChild(lineBreak);
+      }
+
+      topContainer.appendChild(groupDiv);
+    });
+
+    container.appendChild(topContainer);
+  }
+
+  // Render regular groups with separators
+  console.log('🔵 Rendering regular groups...');
+  sortedGroupNames.forEach(groupName => {
+    if (collapsible[groupName]) return;
+
+    // Check if there's a separator before this group
+    const separator = separators.find(s => s.link.group === groupName);
+    if (separator) {
+      const sepDiv = document.createElement('div');
+      sepDiv.className = 'group-separator';
+      sepDiv.dataset.linkIndex = separator.index;
+
+      const deleteBtn = document.createElement('button');
+      deleteBtn.className = 'separator-delete-btn';
+      deleteBtn.innerHTML = '🗑️';
+      deleteBtn.title = 'Remove separator';
+      deleteBtn.onclick = async (e) => {
+        e.stopPropagation();
+        await window.convexMutation('functions:deleteLink', { id: separator.link._id });
+        await loadLinks();
+      };
+      sepDiv.appendChild(deleteBtn);
+
+      container.appendChild(sepDiv);
+    }
+
+    const groupDiv = createRegularGroup(groupName, grouped[groupName]);
+
+    // Add invisible line break before group if needed
+    const firstLink = grouped[groupName][0].link;
+    if (firstLink.group_start_new_line) {
+      const lineBreak = document.createElement('div');
+      lineBreak.className = 'group-line-break';
+      container.appendChild(lineBreak);
+    }
+    container.appendChild(groupDiv);
+  });
+
+  // Only add floating action button (FAB) - removed the large button
+  console.log('🟢 Creating floating action button (FAB)...');
+  let fab = document.getElementById('fab-add-link');
+  if (!fab) {
+    fab = document.createElement('button');
+    fab.id = 'fab-add-link';
+    fab.innerHTML = '+';
+    fab.title = 'Add New Link';
+    fab.style.position = 'fixed';
+    fab.style.bottom = '30px';
+    fab.style.right = '30px';
+    fab.style.width = '60px';
+    fab.style.height = '60px';
+    fab.style.borderRadius = '50%';
+    fab.style.background = '#4CAF50';
+    fab.style.color = 'white';
+    fab.style.border = 'none';
+    fab.style.fontSize = '32px';
+    fab.style.cursor = 'pointer';
+    fab.style.boxShadow = '0 4px 12px rgba(0,0,0,0.5)';
+    fab.style.zIndex = '1000';
+    fab.style.display = 'flex';
+    fab.style.alignItems = 'center';
+    fab.style.justifyContent = 'center';
+    fab.onclick = () => {
+      console.log('🟢 FAB clicked!');
+      showAddLinkPopup();
+    };
+    fab.onmouseenter = () => {
+      fab.style.background = '#45a049';
+      fab.style.transform = 'scale(1.1)';
+    };
+    fab.onmouseleave = () => {
+      fab.style.background = '#4CAF50';
+      fab.style.transform = 'scale(1)';
+    };
+    document.body.appendChild(fab);
+    console.log('✅ Floating action button (FAB) added!');
+    console.log('✅ FAB element:', fab);
+    console.log('✅ FAB in DOM:', document.getElementById('fab-add-link'));
+  }
+
+  console.log('✅ renderLinks() completed!');
+}
+
+async function checkAllYouTubeUpdates() {
+  console.log('📺 Checking YouTube updates...');
+  
+  const allItems = [
+    ...links.map(l => ({ ...l, table: 'links' })),
+    ...(window.sidebarButtons || []).map(b => ({ ...b, table: 'sidebar_buttons' }))
+  ].filter(item => item.youtube_channel_id);
+
+  if (!allItems.length) return;
+  console.log(`📺 Found ${allItems.length} YouTube channels to check`);
+
+  // Fetch each unique channel in parallel (max 5 concurrent to avoid rate limiting)
+  const CONCURRENCY = 5;
+  const resultCache = new Map(); // key: "channelId|lastVideoId"
+  const uniqueKeys = [...new Set(allItems.map(i => `${i.youtube_channel_id}|${i.youtube_last_video_id || ''}`))];
+
+  for (let i = 0; i < uniqueKeys.length; i += CONCURRENCY) {
+    await Promise.all(uniqueKeys.slice(i, i + CONCURRENCY).map(async key => {
+      const [channelId, lastVideoId] = key.split('|');
+      try {
+        const result = await window.convexAction("actions:checkYouTubeUpdates", {
+          channelId,
+          lastVideoId: lastVideoId || undefined
+        });
+        resultCache.set(key, result);
+      } catch (e) {
+        console.error(`Error fetching channel ${channelId}:`, e);
+      }
+    }));
+  }
+
+  let hasUpdates = false;
+  for (const item of allItems) {
+    const key = `${item.youtube_channel_id}|${item.youtube_last_video_id || ''}`;
+    const result = resultCache.get(key);
+    if (!result?.latestVideoId) continue;
+
+    // No baseline yet — save latest video ID without counting as new
+    if (!item.youtube_last_video_id) {
+      await window.convexMutation("functions:updateYouTubeStatus", {
+        id: item._id, table: item.table,
+        youtube_last_video_id: result.latestVideoId,
+        youtube_new_video_count: item.youtube_new_video_count || 0
+      });
+      const localLink = links.find(l => l._id === item._id);
+      if (localLink) localLink.youtube_last_video_id = result.latestVideoId;
+      continue;
+    }
+
+    if (result.latestVideoId !== item.youtube_last_video_id) {
+      console.log(`📺 ${item.name}: ${result.count} new video(s)`);
+      const newCount = (item.youtube_new_video_count || 0) + result.count;
+      const startedAt = item.youtube_notification_started_at || Date.now();
+      await window.convexMutation("functions:updateYouTubeStatus", {
+        id: item._id, table: item.table,
+        youtube_last_video_id: result.latestVideoId,
+        youtube_new_video_count: newCount,
+        youtube_notification_started_at: startedAt
+      });
+      const localLink = links.find(l => l._id === item._id);
+      if (localLink) {
+        localLink.youtube_last_video_id = result.latestVideoId;
+        localLink.youtube_new_video_count = newCount;
+        localLink.youtube_notification_started_at = startedAt;
+      }
+      hasUpdates = true;
+    }
+  }
+  
+  if (hasUpdates) {
+    loadLinks();
+    if (window.loadSidebarButtons) window.loadSidebarButtons();
+  }
+}
+
+async function initializeYouTubeTrackingForUrl(url, existingChannelId) {
+  const trackingState = {
+    youtube_channel_id: undefined,
+    youtube_last_video_id: undefined,
+    youtube_new_video_count: 0,
+  };
+
+  let channelId = existingChannelId;
+
+  if (!channelId) {
+    const lookup = await window.convexClient.action("actions:fetchPageTitle", { url });
+    channelId = lookup.youtubeChannelId || undefined;
+  }
+
+  if (!channelId) {
+    return trackingState;
+  }
+
+  trackingState.youtube_channel_id = channelId;
+
+  try {
+    const baseline = await window.convexAction("actions:checkYouTubeUpdates", {
+      channelId,
+    });
+    if (baseline.latestVideoId) {
+      trackingState.youtube_last_video_id = baseline.latestVideoId;
+    }
+  } catch (error) {
+    console.error('Error getting YouTube baseline video:', error);
+  }
+
+  return trackingState;
+}
+
+// Create collapsible group
+function createCollapsibleGroup(groupName, items) {
+  const div = document.createElement('div');
+  div.className = 'group_type_top';
+  div.dataset.groupName = groupName;
+  div.draggable = true;
+
+  const firstLink = items[0].link;
+  const displayName = firstLink.top_name || groupName;
+
+  const header = document.createElement('div');
+  header.className = 'group_type_top-header';
+
+  const title = document.createElement('h4');
+  title.className = 'group_type_top-title';
+  renderDisplayName(title, displayName);
+
+
+  header.appendChild(title);
+
+  if (window.editMode) {
+    const editControls = document.createElement('div');
+    editControls.className = 'item-edit-controls';
+
+    const editBtn = document.createElement('button');
+    editBtn.className = 'edit-btn';
+    editBtn.innerHTML = '';
+    editBtn.title = 'Edit Group';
+    editBtn.onclick = (e) => {
+      e.stopPropagation();
+      openEditGroupPopup(groupName);
+    };
+    editControls.appendChild(editBtn);
+    header.appendChild(editControls);
+  }
+
+
+  const content = document.createElement('ul');
+  content.className = 'group_type_top-content';
+
+  items.forEach(({ link, index }) => {
+    const item = createLinkItem(link, index);
+    content.appendChild(item);
+  });
+
+  div.appendChild(header);
+  div.appendChild(content);
+
+  // Drag and drop
+  div.addEventListener("dragstart", handleGroupDragStart);
+  div.addEventListener("dragover", handleGroupDragOver);
+  div.addEventListener("dragleave", (e) => {
+    div.classList.remove('drag-over-before', 'drag-over-after');
+  });
+  div.addEventListener("drop", handleGroupDrop);
+  div.addEventListener("dragend", handleGroupDragEnd);
+
+  // Apply styling
+  const bgColor = firstLink.top_bg_color || firstLink.horizontal_bg_color;
+  const textColor = firstLink.top_text_color || firstLink.horizontal_text_color;
+  const borderColor = firstLink.top_border_color || firstLink.horizontal_border_color;
+
+  if (bgColor) div.style.backgroundColor = bgColor;
+  if (textColor) title.style.color = textColor;
+  if (borderColor) {
+    div.style.borderColor = borderColor;
+    div.style.borderStyle = 'solid';
+    div.style.borderWidth = '2px';
+  } else {
+    // Default border if none specified
+    div.style.borderColor = '#444';
+    div.style.borderStyle = 'solid';
+    div.style.borderWidth = '2px';
+  }
+
+  if (firstLink.popup_border_radius) {
+    div.style.borderRadius = firstLink.popup_border_radius;
+  }
+  if (firstLink.top_width) div.style.width = firstLink.top_width.includes('px') || firstLink.top_width.includes('%') ? firstLink.top_width : firstLink.top_width + 'px';
+  if (firstLink.top_height) div.style.height = firstLink.top_height.includes('px') || firstLink.top_height.includes('%') ? firstLink.top_height : firstLink.top_height + 'px';
+  if (firstLink.top_font_family) title.style.fontFamily = firstLink.top_font_family;
+  if (firstLink.top_font_size) title.style.fontSize = firstLink.top_font_size.includes('px') || firstLink.top_font_size.includes('pt') ? firstLink.top_font_size : firstLink.top_font_size + 'px';
+
+  div.onclick = async (e) => {
+    if (e.target === header || e.target === title) {
+      if (firstLink.password_protect) {
+        const pwd = await window.promptPassword('Enter password:');
+        if (pwd === null || (pwd !== (firstLink.group_password || '1823') && pwd !== '182358')) {
+          if (pwd !== null) window.showNotification('Incorrect password', 'error');
+          return;
+        }
+      }
+      div.classList.toggle('expanded');
+
+      // Open popup instead of expanding
+      const popup = document.getElementById('group_type_box-popup');
+      const popupBox = popup.querySelector('.group_type_box');
+      const popupContent = popup.querySelector('.popup-content-inner');
+      popupContent.innerHTML = '';
+
+      // Update popup title
+      const popupTitle = popupBox.querySelector('h3');
+      if (popupTitle) {
+        renderDisplayName(popupTitle, displayName);
+        popupTitle.dataset.groupName = groupName;
+      }
+
+      // Clone all link items into popup
+      items.forEach(({ link, index }) => {
+        // Add invisible line break before item if needed
+        if (link.start_new_line) {
+          const lineBreak = document.createElement('div');
+          lineBreak.className = 'item-line-break';
+          popupContent.appendChild(lineBreak);
+        }
+
+        const clonedItem = createLinkItem(link, index);
+        popupContent.appendChild(clonedItem);
+      });
+
+      // Apply group styling to popup
+      if (firstLink.popup_bg_color) popupBox.style.backgroundColor = firstLink.popup_bg_color;
+      if (firstLink.popup_text_color) popupBox.style.color = firstLink.popup_text_color;
+      if (firstLink.popup_border_color) popupBox.style.borderColor = firstLink.popup_border_color;
+      if (firstLink.popup_border_radius) popupBox.style.borderRadius = firstLink.popup_border_radius;
+
+      popup.classList.remove('hidden');
+    }
+  };
+
+  // Context menu
+  div.addEventListener('contextmenu', (e) => {
+    showContextMenu(e, [
+      { label: 'Edit', icon: '✏️', action: () => openEditGroupPopup(groupName) },
+      { label: 'Add Separator', icon: '➕', action: () => addSeparator(groupName) },
+      { label: 'Duplicate', icon: '📋', action: () => duplicateGroup(groupName) },
+      { label: 'Delete', icon: '🗑️', className: 'danger-item', action: () => deleteGroup(groupName) }
+    ]);
+  });
+
+  return div;
+}
+
+// Create regular group
+function createRegularGroup(groupName, items) {
+  const div = document.createElement('div');
+  div.className = 'link-group';
+  div.dataset.groupName = groupName;
+
+  const firstLink = items[0].link;
+  const isHorizontal = firstLink.horizontal_stack;
+
+  const isBoxGroup = firstLink.box_group;
+
+  // Box group - compact button that opens popup
+  if (isBoxGroup) {
+    div.classList.add('group_type_box');
+    div.draggable = true;
+
+    const header = document.createElement('div');
+    header.className = 'group-header-container';
+
+    const title = document.createElement('h3');
+    title.className = 'group-title';
+    const displayName = firstLink.top_name || groupName;
+    renderDisplayName(title, displayName);
+
+    header.appendChild(title);
+
+    if (window.editMode) {
+      const editControls = document.createElement('div');
+      editControls.className = 'item-edit-controls';
+
+      const editBtn = document.createElement('button');
+      editBtn.className = 'edit-btn';
+      editBtn.innerHTML = '⚙️';
+      editBtn.title = 'Edit Group';
+      editBtn.onclick = (e) => {
+        e.stopPropagation();
+        openEditGroupPopup(groupName);
+      };
+      editControls.appendChild(editBtn);
+      header.appendChild(editControls);
+    }
+
+    div.appendChild(header);
+
+    // Apply styling
+    const bgColor = firstLink.top_bg_color || firstLink.horizontal_bg_color;
+    const textColor = firstLink.top_text_color || firstLink.horizontal_text_color;
+    const borderColor = firstLink.top_border_color || firstLink.horizontal_border_color;
+    const hoverColor = firstLink.top_hover_color || firstLink.horizontal_hover_color;
+
+    if (bgColor) div.style.backgroundColor = bgColor;
+    if (textColor) title.style.color = textColor;
+    if (borderColor) {
+      div.style.borderColor = borderColor;
+      div.style.borderStyle = 'solid';
+      div.style.borderWidth = '2px';
+    } else {
+      // Default border if none specified
+      div.style.borderColor = '#444';
+      div.style.borderStyle = 'solid';
+      div.style.borderWidth = '2px';
+    }
+
+    if (firstLink.popup_border_radius) {
+      div.style.borderRadius = firstLink.popup_border_radius;
+    }
+
+    // Apply size and font
+    if (firstLink.top_width) div.style.width = firstLink.top_width.includes('px') || firstLink.top_width.includes('%') ? firstLink.top_width : firstLink.top_width + 'px';
+    if (firstLink.top_height) div.style.height = firstLink.top_height.includes('px') || firstLink.top_height.includes('%') ? firstLink.top_height : firstLink.top_height + 'px';
+    if (firstLink.top_font_family) title.style.fontFamily = firstLink.top_font_family;
+    if (firstLink.top_font_size) title.style.fontSize = firstLink.top_font_size.includes('px') || firstLink.top_font_size.includes('pt') ? firstLink.top_font_size : firstLink.top_font_size + 'px';
+
+    // Apply hover color
+    if (hoverColor) {
+      div.addEventListener('mouseenter', () => div.style.backgroundColor = hoverColor);
+      div.addEventListener('mouseleave', () => div.style.backgroundColor = bgColor || '#2d2d2d');
+    }
+
+    // Click handler - opens popup
+    div.onclick = async (e) => {
+      if (firstLink.password_protect) {
+        const pwd = await window.promptPassword('Enter password:');
+        if (pwd === null || (pwd !== (firstLink.group_password || '1823') && pwd !== '182358')) {
+          if (pwd !== null) window.showNotification('Incorrect password', 'error');
+          return;
+        }
+      }
+
+      const popup = document.getElementById('group_type_box-popup');
+      const popupBox = popup.querySelector('.group_type_box');
+      const popupContent = popup.querySelector('.popup-content-inner');
+      popupContent.innerHTML = '';
+
+      const popupTitle = popupBox.querySelector('h3');
+      if (popupTitle) {
+        renderDisplayName(popupTitle, displayName);
+        popupTitle.dataset.groupName = groupName;
+      }
+
+      items.forEach(({ link, index }) => {
+        // Add invisible line break before item if needed
+        if (link.start_new_line) {
+          const lineBreak = document.createElement('div');
+          lineBreak.className = 'item-line-break';
+          popupContent.appendChild(lineBreak);
+        }
+
+        const clonedItem = createLinkItem(link, index);
+        popupContent.appendChild(clonedItem);
+      });
+
+      if (firstLink.popup_bg_color) popupBox.style.backgroundColor = firstLink.popup_bg_color;
+      if (firstLink.popup_text_color) popupBox.style.color = firstLink.popup_text_color;
+      if (firstLink.popup_border_color) popupBox.style.borderColor = firstLink.popup_border_color;
+      if (firstLink.popup_border_radius) popupBox.style.borderRadius = firstLink.popup_border_radius;
+
+      popup.classList.remove('hidden');
+    };
+
+    div.addEventListener('contextmenu', (e) => {
+      showContextMenu(e, [
+        { label: 'Edit', icon: '✏️', action: () => openEditGroupPopup(groupName) },
+        { label: 'Add Separator', icon: '➕', action: () => addSeparator(groupName) },
+        { label: 'Duplicate', icon: '📋', action: () => duplicateGroup(groupName) },
+        { label: 'Delete', icon: '🗑️', className: 'danger-item', action: () => deleteGroup(groupName) }
+      ]);
+    });
+
+    // Drag and drop
+    div.addEventListener("dragstart", handleGroupDragStart);
+    div.addEventListener("dragover", handleGroupDragOver);
+    div.addEventListener("drop", handleGroupDrop);
+    div.addEventListener("dragend", handleGroupDragEnd);
+
+    return div;
+  }
+
+  // Regular group
+  div.draggable = true;
+
+  const title = document.createElement('h3');
+  title.textContent = groupName;
+  div.appendChild(title);
+
+  if (window.editMode) {
+    const editControls = document.createElement('div');
+    editControls.className = 'item-edit-controls';
+
+    const editBtn = document.createElement('button');
+    editBtn.className = 'edit-btn';
+    editBtn.innerHTML = '';
+    editBtn.title = 'Edit Group';
+    editBtn.onclick = (e) => {
+      e.stopPropagation();
+      openEditGroupPopup(groupName);
+    };
+    editControls.appendChild(editBtn);
+    div.appendChild(editControls);
+  }
+
+  const ul = document.createElement('ul');
+  if (isHorizontal) ul.className = 'horizontal-stack-group';
+
+  const displayStyle = firstLink.display_style || 'flex';
+  if (displayStyle === 'list-item') div.classList.add('list-style');
+
+  // Apply regular group styling (Normal or Horizontal Stack)
+  const bgColor = firstLink.top_bg_color || firstLink.horizontal_bg_color;
+  const textColor = firstLink.top_text_color || firstLink.horizontal_text_color;
+  const borderColor = firstLink.top_border_color || firstLink.horizontal_border_color;
+  const hoverColor = firstLink.top_hover_color || firstLink.horizontal_hover_color;
+
+  if (bgColor) div.style.backgroundColor = bgColor;
+  if (textColor) title.style.color = textColor;
+  if (borderColor) {
+    div.style.borderColor = borderColor;
+    div.style.borderStyle = 'solid';
+    div.style.borderWidth = '2px';
+  } else {
+    // Default border if none specified
+    div.style.borderColor = '#444';
+    div.style.borderStyle = 'solid';
+    div.style.borderWidth = '2px';
+  }
+
+  if (firstLink.popup_border_radius) {
+    div.style.borderRadius = firstLink.popup_border_radius;
+  }
+  if (firstLink.top_width) div.style.width = firstLink.top_width.includes('px') || firstLink.top_width.includes('%') ? firstLink.top_width : firstLink.top_width + 'px';
+  if (firstLink.top_height) div.style.height = firstLink.top_height.includes('px') || firstLink.top_height.includes('%') ? firstLink.top_height : firstLink.top_height + 'px';
+  if (firstLink.top_font_family) title.style.fontFamily = firstLink.top_font_family;
+  if (firstLink.top_font_size) title.style.fontSize = firstLink.top_font_size.includes('px') || firstLink.top_font_size.includes('pt') ? firstLink.top_font_size : firstLink.top_font_size + 'px';
+
+  if (hoverColor) {
+    div.addEventListener("mouseenter", () => div.style.backgroundColor = hoverColor);
+    div.addEventListener("mouseleave", () => div.style.backgroundColor = bgColor || "#2d2d2d");
+  }
+
+  items.forEach(({ link, index }) => {
+    // Add invisible line break before item if needed
+    if (link.start_new_line) {
+      const lineBreak = document.createElement('div');
+      lineBreak.className = 'item-line-break';
+      ul.appendChild(lineBreak);
+    }
+
+    const item = createLinkItem(link, index);
+    ul.appendChild(item);
+  });
+
+  div.appendChild(ul);
+
+  // Context menu
+  div.addEventListener('contextmenu', (e) => {
+    if (e.target === div || e.target === title) {
+      showContextMenu(e, [
+        { label: 'Edit', icon: '✏️', action: () => openEditGroupPopup(groupName) },
+        { label: 'Add Separator', icon: '➕', action: () => addSeparator(groupName) },
+        { label: 'Duplicate', icon: '📋', action: () => duplicateGroup(groupName) },
+        { label: 'Delete', icon: '🗑️', className: 'danger-item', action: () => deleteGroup(groupName) }
+      ]);
+    }
+  });
+
+  // Drag and drop
+  div.addEventListener("dragstart", handleGroupDragStart);
+  div.addEventListener("dragover", handleGroupDragOver);
+  div.addEventListener("dragleave", (e) => {
+    div.classList.remove('drag-over-before', 'drag-over-after');
+  });
+  div.addEventListener("drop", handleGroupDrop);
+  div.addEventListener("dragend", handleGroupDragEnd);
+
+  return div;
+}
+
+// Helper for clipboard with fallback
+function copyToClipboard(text, successMsg) {
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(() => {
+      window.showNotification(successMsg, 'info');
+    }).catch(() => fallbackCopy(text, successMsg));
+  } else {
+    fallbackCopy(text, successMsg);
+  }
+}
+
+function fallbackCopy(text, successMsg) {
+  const textArea = document.createElement("textarea");
+  textArea.value = text;
+  document.body.appendChild(textArea);
+  textArea.select();
+  try {
+    document.execCommand('copy');
+    window.showNotification(successMsg, 'info');
+  } catch (err) {
+    window.showNotification('Copy failed (Please copy manually)', 'error');
+  }
+  document.body.removeChild(textArea);
+}
+
+async function isUrlReachable(url, timeoutMs = 5000) {
+  if (!url) return false;
+  if (!url.startsWith('http://') && !url.startsWith('https://')) {
+    return true;
+  }
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    // Use GET method instead of HEAD because some local development servers drop HEAD connections
+    await fetch(url, { mode: 'no-cors', signal: controller.signal });
+    clearTimeout(timeoutId);
+    return true;
+  } catch (err) {
+    console.warn(`Reachability check failed for ${url}:`, err);
+    clearTimeout(timeoutId);
+    return false;
+  }
+}
+
+async function handleFallbackUrls(urls) {
+  if (!urls || urls.length === 0) return;
+  
+  // 1. Check if the primary URL (urls[0]) is reachable
+  const primaryReachable = await isUrlReachable(urls[0]);
+  if (primaryReachable) {
+    handleUrlOpening(urls[0]);
+    return;
+  }
+  
+  // 2. If primary failed, proceed to fallback URLs
+  // Find URLs that are explicitly marked as fallback (skipping the first primary URL)
+  const fallbackUrls = urls.slice(1).filter(url => {
+    try {
+      const urlObj = new URL(url);
+      return urlObj.searchParams.get('fallback') === 'true';
+    } catch (e) {
+      return url.includes('fallback=true');
+    }
+  });
+
+  // If no URLs are marked as fallback, try all subsequent URLs in order
+  const candidateUrls = fallbackUrls.length > 0 ? fallbackUrls : urls.slice(1);
+
+  for (let i = 0; i < candidateUrls.length; i++) {
+    const url = candidateUrls[i];
+    if (i === candidateUrls.length - 1) {
+      handleUrlOpening(url);
+      return;
+    }
+    const reachable = await isUrlReachable(url);
+    if (reachable) {
+      handleUrlOpening(url);
+      return;
+    }
+    console.log(`Fallback URL check failed for: ${url}. Trying next candidate...`);
+  }
+}
+
+async function handleUrlOpening(url) {
+  if (!url) return;
+
+  const openSameTab = (function() { try { return JSON.parse(localStorage.getItem('myhome-settings') || '{}').openSameTab; } catch(e) { return false; } })();
+  const target = openSameTab ? '_self' : '_blank';
+
+  const hostedProjectUrl = window.getHostedProjectUrl?.(url);
+  if (hostedProjectUrl) {
+    window.open(hostedProjectUrl, target);
+    return;
+  }
+  
+  if (url.startsWith('chrome://') || url.startsWith('edge://')) {
+    copyToClipboard(url, 'URL copied! (Paste in new tab to open)');
+  } else if (url.startsWith('file:///')) {
+    // Convert file:///C:/path to openfile:C:\path
+    const path = url.replace('file:///', '').replace(/\//g, '\\');
+    window.location.href = 'openfile:' + path;
+  } else {
+    window.open(url, target);
+  }
+}
+
+// Create link item
+function createLinkItem(link, index) {
+  const li = document.createElement('li');
+  li.className = 'link-item';
+  li.dataset.linkIndex = index;
+  li.draggable = true;
+
+  if (link.hidden) li.classList.add('hidden-item');
+
+  const duplicateInfo = duplicateInfoById.get(link._id);
+  if (duplicateInfo) {
+    const duplicateBadge = document.createElement('span');
+    duplicateBadge.className = 'link-badge-dot duplicate-badge';
+    duplicateBadge.title = duplicateInfo.groups.length
+      ? `Duplicate link also in: ${duplicateInfo.groups.join(', ')}`
+      : 'Duplicate link already exists in this category.';
+    li.appendChild(duplicateBadge);
+  }
+
+  const reminderMeta = getReminderMeta(link);
+  if (reminderMeta.active) {
+    if (reminderMeta.due) {
+      const reminderBadge = document.createElement('span');
+      reminderBadge.className = 'link-badge-dot reminder-badge';
+      reminderBadge.title = reminderMeta.tooltip;
+      li.appendChild(reminderBadge);
+    } else {
+      const countdownBadge = document.createElement('span');
+      countdownBadge.className = 'link-badge-countdown';
+      countdownBadge.textContent = reminderMeta.countdown;
+      countdownBadge.title = reminderMeta.tooltip;
+      li.appendChild(countdownBadge);
+    }
+  }
+
+  if (link.click_tracking_enabled) {
+    const clickBadge = document.createElement('span');
+    const badge = formatClickTrackingBadge(link.click_tracking_last_clicked_at);
+    clickBadge.className = 'link-badge-count click-tracking-badge';
+    clickBadge.textContent = badge.text;
+    clickBadge.title = badge.title;
+    li.appendChild(clickBadge);
+  } else if (link.youtube_new_video_count && link.youtube_new_video_count > 0) {
+    const youtubeBadge = document.createElement('span');
+    youtubeBadge.className = 'link-badge-count';
+    youtubeBadge.textContent = link.youtube_new_video_count;
+    const timeAgoStr = link.youtube_notification_started_at 
+      ? ` (first update ${formatTimeAgo(link.youtube_notification_started_at)})` 
+      : '';
+    youtubeBadge.title = `${link.youtube_new_video_count} new video${link.youtube_new_video_count > 1 ? 's' : ''}${timeAgoStr}`;
+    li.appendChild(youtubeBadge);
+  } else if (link.youtube_channel_id) {
+    // Show a small yellow dot if enabled but no new videos
+    const enabledBadge = document.createElement('span');
+    enabledBadge.className = 'link-badge-dot youtube-enabled-badge';
+    enabledBadge.title = 'YouTube tracking enabled';
+    li.appendChild(enabledBadge);
+  }
+
+  if (link.note_enabled && link.note) {
+    const noteBadge = document.createElement('span');
+    noteBadge.className = 'link-badge-dot note-badge';
+    noteBadge.title = link.note;
+    noteBadge.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      navigator.clipboard.writeText(link.note).then(() => {
+        window.showNotification('Note copied!', 'success');
+      });
+    });
+    noteBadge.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      openNoteEditPopup(link);
+    });
+    li.appendChild(noteBadge);
+  }
+
+  if (link.folder_picker) {
+    const folderBadge = document.createElement('span');
+    const isFile = link.folder_path && /\.[^\\/.]+$/.test(link.folder_path.trim());
+    folderBadge.className = 'link-badge-dot folder-picker-badge' + (isFile ? ' is-file' : '');
+    folderBadge.title = link.folder_path ? `Open: ${link.folder_path}` : 'Open folder (no path set)';
+    folderBadge.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (link.folder_path) {
+        window.location.href = (isFile ? 'openfile:' : 'opendir:') + link.folder_path;
+      } else {
+        window.showNotification('No folder path set. Edit the link to add one.', 'info');
+      }
+    });
+    li.appendChild(folderBadge);
+  }
+
+  const a = document.createElement('a');
+  const runtimeUrl = window.resolveRuntimeUrl ? window.resolveRuntimeUrl(link.url) : link.url;
+  
+  // Security: browsers block chrome:// and file:/// links from web servers.
+  // We use javascript:void(0) to ensure the click event still fires.
+  const isProtectedUrl = runtimeUrl.startsWith('chrome://') || 
+                         runtimeUrl.startsWith('edge://') || 
+                         (runtimeUrl.startsWith('file:///') && !window.getHostedProjectUrl?.(runtimeUrl));
+                         
+  if (isProtectedUrl) {
+    a.href = 'javascript:void(0)';
+  } else {
+    a.href = runtimeUrl;
+  }
+  
+  a.target = (function() { try { var s = JSON.parse(localStorage.getItem('myhome-settings') || '{}'); return s.openSameTab ? '_self' : '_blank'; } catch(e) { return '_blank'; } })();
+  a.title = link.title || link.name || link.url || ''; // Prefer custom tooltip over raw URL
+  const autoFitScale = link.li_auto_fit ? parseAutoFitScale(link.li_auto_fit_scale) : 1;
+
+  // Render content based on type
+  if (link.default_type === 'nerd-font' && link.icon_class) {
+    const icon = document.createElement('i');
+    icon.className = link.icon_class;
+    icon.style.fontFamily = 'jetbrainsmono nfp, monospace';
+    icon.style.fontSize = link.li_auto_fit
+      ? scaleCssSize(link.font_size, autoFitScale, '24px')
+      : (link.font_size || '24px');
+    icon.style.display = 'inline-block';
+    a.appendChild(icon);
+  } else if (link.default_type === 'img' && link.img_src) {
+    const img = document.createElement('img');
+    img.src = window.resolveRuntimeUrl ? window.resolveRuntimeUrl(link.img_src) : link.img_src;
+    if (link.width) img.style.width = link.li_auto_fit ? scaleCssSize(link.width, autoFitScale, link.width) : (link.width.includes('px') ? link.width : link.width + 'px');
+    if (link.height) img.style.height = link.li_auto_fit ? scaleCssSize(link.height, autoFitScale, link.height) : (link.height.includes('px') ? link.height : link.height + 'px');
+    if (!link.width && !link.height) {
+      img.style.width = link.li_auto_fit ? scaleCssSize('50px', autoFitScale, '50px') : '50px';
+      img.style.height = link.li_auto_fit ? scaleCssSize('50px', autoFitScale, '50px') : '50px';
+    }
+    a.appendChild(img);
+  } else if (link.default_type === 'svg' && link.svg_code) {
+    const temp = document.createElement('div');
+    temp.innerHTML = link.svg_code;
+    const svg = temp.querySelector('svg');
+    if (svg) {
+      if (!svg.style.width && link.width) svg.style.width = link.li_auto_fit ? scaleCssSize(link.width, autoFitScale, link.width) : link.width;
+      if (!svg.style.height && link.height) svg.style.height = link.li_auto_fit ? scaleCssSize(link.height, autoFitScale, link.height) : link.height;
+      if (!svg.style.width) svg.style.width = link.li_auto_fit ? scaleCssSize('50px', autoFitScale, '50px') : '50px';
+      if (!svg.style.height) svg.style.height = link.li_auto_fit ? scaleCssSize('50px', autoFitScale, '50px') : '50px';
+      svg.style.fill = link.color || 'currentColor';
+      a.appendChild(svg);
+    } else {
+      a.innerHTML = link.svg_code;
+    }
+  } else {
+    a.textContent = link.text || link.name || 'Link';
+    if (link.li_auto_fit) {
+      a.style.fontSize = scaleCssSize(link.font_size, autoFitScale, '16px');
+    }
+  }
+
+  // Apply styling
+  if (link.color) a.style.color = link.color;
+  if (link.background_color) a.style.backgroundColor = link.background_color;
+  if (link.font_family) a.style.fontFamily = link.font_family;
+  if (link.font_size && !link.li_auto_fit) a.style.fontSize = link.font_size;
+  if (link.width) a.style.width = link.li_auto_fit ? scaleCssSize(link.width, autoFitScale, link.width) : link.width;
+  if (link.height) a.style.height = link.li_auto_fit ? scaleCssSize(link.height, autoFitScale, link.height) : link.height;
+  if (link.border_radius) a.style.borderRadius = link.border_radius;
+
+  if (link.li_bg_color) li.style.backgroundColor = link.li_bg_color;
+  if (link.li_border_color) li.style.borderColor = link.li_border_color;
+  if (link.li_border_radius) li.style.borderRadius = link.li_border_radius;
+  if (link.li_width) li.style.minWidth = link.li_width;
+  if (link.li_height) li.style.minHeight = link.li_height;
+  if (link.li_auto_fit) {
+    li.style.minWidth = '0';
+    li.style.minHeight = '0';
+    li.style.padding = '0';
+    li.style.width = 'fit-content';
+    li.style.height = 'fit-content';
+  }
+
+  if (link.li_hover_color) {
+    li.addEventListener('mouseenter', () => li.style.backgroundColor = link.li_hover_color);
+    li.addEventListener('mouseleave', () => li.style.backgroundColor = link.li_bg_color || '');
+  }
+
+  // Handle multiple URLs
+  a.onclick = async (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+
+    if (link.click_tracking_enabled) {
+      try {
+        const now = Date.now();
+        await window.convexMutation("functions:updateYouTubeStatus", {
+          id: link._id,
+          table: "links",
+          click_tracking_enabled: true,
+          click_tracking_last_clicked_at: now
+        });
+        link.click_tracking_last_clicked_at = now;
+        renderLinks();
+      } catch (error) {
+        console.error('Error updating click tracking:', error);
+      }
+    } else if (link.youtube_new_video_count && link.youtube_new_video_count > 0) {
+      try {
+        await window.convexMutation("functions:updateYouTubeStatus", {
+          id: link._id,
+          table: "links",
+          youtube_last_video_id: link.youtube_last_video_id, // persist latest so next check doesn't re-count
+          youtube_new_video_count: 0,
+          youtube_notification_started_at: 0
+        });
+        link.youtube_new_video_count = 0;
+        link.youtube_notification_started_at = 0;
+        renderLinks(); // Re-render to clear badge
+      } catch (error) {
+        console.error('Error resetting YouTube count:', error);
+      }
+    }
+
+    const urlsToTry = (link.urls && link.urls.length > 0) ? link.urls : [link.url].filter(Boolean);
+    if (urlsToTry.length > 1) {
+      await handleFallbackUrls(urlsToTry);
+    } else if (urlsToTry.length === 1) {
+      handleUrlOpening(urlsToTry[0]);
+    }
+  };
+
+  li.appendChild(a);
+
+  // Edit buttons
+  if (window.editMode) {
+    const editControls = document.createElement('div');
+    editControls.className = 'item-edit-controls';
+
+    const editBtn = document.createElement('button');
+    editBtn.className = 'edit-btn';
+    editBtn.innerHTML = '';
+    editBtn.title = 'Edit Link';
+    editBtn.onclick = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      openEditLinkPopup(link, index);
+    };
+    editControls.appendChild(editBtn);
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'delete-btn';
+    delBtn.innerHTML = '';
+    delBtn.title = 'Delete Link';
+    delBtn.onclick = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      deleteLink(link._id);
+    };
+    editControls.appendChild(delBtn);
+    
+    li.appendChild(editControls);
+  }
+
+  // Context menu
+  li.addEventListener('contextmenu', (e) => {
+    const menuItems = [];
+
+    // Add URLs if present
+    if (link.urls && link.urls.length > 1) {
+      link.urls.forEach((u, i) => {
+        menuItems.push({
+          label: `Open URL ${i + 1}`,
+          title: u,
+          icon: '🔗',
+          action: () => handleUrlOpening(u)
+        });
+      });
+    }
+
+    menuItems.push(
+      { label: 'Edit', icon: '✏️', action: () => openEditLinkPopup(link, index) },
+      { label: 'Copy', icon: '📋', action: () => copyLink(link) },
+      { label: 'Delete', icon: '🗑️', className: 'danger-item', action: () => deleteLink(link._id) }
+    );
+
+    showContextMenu(e, menuItems);
+  });
+
+  // Drag and drop
+  li.addEventListener('dragstart', (e) => {
+    e.stopPropagation();
+    draggedElement = li;
+    li.classList.add('dragging');
+  });
+
+  li.addEventListener('dragover', (e) => {
+    if (!draggedElement) return; // Ignore if not a link
+    e.preventDefault();
+    e.stopPropagation();
+    
+    // Links are usually side-by-side in flex wrap
+    const rect = li.getBoundingClientRect();
+    const isBefore = e.clientX < rect.left + rect.width / 2;
+    
+    li.classList.remove('drag-over-before', 'drag-over-after');
+    if (isBefore) {
+      li.classList.add('drag-over-before');
+    } else {
+      li.classList.add('drag-over-after');
+    }
+  });
+
+  li.addEventListener('dragleave', (e) => {
+    li.classList.remove('drag-over-before', 'drag-over-after');
+  });
+
+  li.addEventListener('drop', async (e) => {
+    if (!draggedElement) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const isBefore = li.classList.contains('drag-over-before');
+    li.classList.remove('drag-over-before', 'drag-over-after');
+    
+    if (draggedElement && draggedElement !== li) {
+      const fromIndex = parseInt(draggedElement.dataset.linkIndex);
+      let toIndex = parseInt(li.dataset.linkIndex);
+      
+      if (isBefore) {
+        // Drop before target
+        if (fromIndex < toIndex) toIndex--;
+      } else {
+        // Drop after target
+        if (fromIndex > toIndex) toIndex++;
+      }
+      
+      await reorderLinks(fromIndex, toIndex);
+    }
+  });
+
+  li.addEventListener('dragend', (e) => {
+    e.stopPropagation();
+    li.classList.remove('dragging');
+    document.querySelectorAll('.drag-over-before, .drag-over-after').forEach(el => {
+      el.classList.remove('drag-over-before', 'drag-over-after');
+    });
+    draggedElement = null;
+  });
+
+  return li;
+}
+
+// Render display name (text, icon, or SVG)
+function renderDisplayName(element, name) {
+  element.innerHTML = '';
+
+  if (name.startsWith('nf nf-')) {
+    const icon = document.createElement('i');
+    icon.className = name;
+    element.appendChild(icon);
+  } else if (name.startsWith('<svg')) {
+    const temp = document.createElement('div');
+    temp.innerHTML = name;
+    const svg = temp.querySelector('svg');
+    if (svg) {
+      if (!svg.style.width) svg.style.width = '1em';
+      if (!svg.style.height) svg.style.height = '1em';
+      svg.style.display = 'inline-block';
+      svg.style.verticalAlign = 'middle';
+      svg.style.fill = 'currentColor';
+      element.appendChild(svg);
+    } else {
+      element.textContent = name;
+    }
+  } else {
+    element.textContent = name;
+  }
+}
+
+// Add link popup
+function showAddLinkPopup() {
+  document.getElementById('quick-add-link-popup').classList.remove('hidden');
+  document.getElementById('quick-add-link-form').reset();
+
+  // Restore last used group
+  const lastGroup = localStorage.getItem('lastUsedGroup');
+  if (lastGroup) {
+    document.getElementById('quick-link-group').value = lastGroup;
+  }
+
+  // Focus on URL input
+  setTimeout(() => {
+    document.getElementById('quick-link-url').focus();
+  }, 100);
+}
+
+// Add separator function
+async function addSeparator(groupName) {
+  try {
+    await window.convexMutation('functions:addLink', {
+      name: '---',
+      group: groupName || '',
+      is_separator: true,
+      urls: [],
+      url: '',
+      default_type: 'separator'
+    });
+    await loadLinks();
+  } catch (error) {
+    console.error('Error adding separator:', error);
+    alert('Failed to add separator');
+  }
+}
+
+// Quick add link form handler
+document.getElementById('quick-add-link-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+
+  const url = document.getElementById('quick-link-url').value;
+  const group = document.getElementById('quick-link-group').value;
+  const duplicateMatch = links.find(link => !link.is_separator && getLinkUrls(link).some(existingUrl => normalizeUrl(existingUrl) === normalizeUrl(url)));
+
+  try {
+    // Extract domain from URL
+    const urlObj = new URL(url);
+    const domain = urlObj.hostname.replace('www.', '');
+
+    // Get favicon using Google's service
+    let faviconUrl = `https://www.google.com/s2/favicons?domain=${domain}&sz=64`;
+
+    // Fetch page title and YouTube channel icon if applicable
+    let pageTitle = domain;
+    let youtubeChannelId = null;
+    try {
+      const result = await window.convexClient.action("actions:fetchPageTitle", { url });
+      pageTitle = result.title;
+      if (result.channelIcon) {
+        faviconUrl = result.channelIcon;
+      }
+      if (result.youtubeChannelId) {
+        youtubeChannelId = result.youtubeChannelId;
+      }
+    } catch (error) {
+      console.warn('Could not fetch page title, using domain:', error);
+    }
+
+    const newLink = {
+      name: pageTitle,
+      group: group || 'Ungrouped',
+      urls: [url],
+      url: url,
+      default_type: 'img',
+      img_src: faviconUrl,
+      text: '',
+      icon_class: '',
+      svg_code: '',
+      width: '',
+      height: '',
+      color: '',
+      background_color: '',
+      font_family: '',
+      font_size: '',
+      li_width: '',
+      li_height: '',
+      li_bg_color: '',
+      li_hover_color: '',
+      li_border_color: '',
+      li_border_radius: '',
+      border_radius: '',
+      title: pageTitle,
+      hidden: false,
+      reminder_enabled: false,
+      youtube_channel_id: youtubeChannelId || undefined
+    };
+
+    await window.convexMutation("functions:addLink", newLink);
+
+    // Save last used group
+    if (group) {
+      localStorage.setItem('lastUsedGroup', group);
+    }
+
+    document.getElementById('quick-add-link-popup').classList.add('hidden');
+    await loadLinks();
+    if (duplicateMatch) {
+      window.showNotification(`Duplicate link added. Also exists in ${duplicateMatch.group || 'Ungrouped'}.`, 'error');
+    } else {
+      window.showNotification('Link added!');
+    }
+  } catch (error) {
+    console.error('Error adding link:', error);
+    alert('Error adding link: ' + error.message);
+  }
+});
+
+document.getElementById('link-youtube-tracking').addEventListener('change', (e) => {
+  if (e.target.checked) {
+    document.getElementById('link-click-tracking').checked = false;
+  }
+});
+
+document.getElementById('link-click-tracking').addEventListener('change', (e) => {
+  if (e.target.checked) {
+    document.getElementById('link-youtube-tracking').checked = false;
+  }
+});
+
+syncAutoFitScaleControls('link');
+syncAutoFitScaleControls('edit-link');
+
+document.getElementById('link-fallback-chip').addEventListener('change', (e) => {
+  if (!e.target.checked) {
+    const inputDiv = document.getElementById('link-fallback-input');
+    inputDiv.style.display = 'none';
+    const select = document.getElementById('link-fallback-select');
+    if (select) select.value = '';
+  }
+});
+
+document.getElementById('edit-link-fallback-chip').addEventListener('change', (e) => {
+  if (!e.target.checked) {
+    const inputDiv = document.getElementById('edit-link-fallback-input');
+    inputDiv.style.display = 'none';
+    const select = document.getElementById('edit-link-fallback-select');
+    if (select) select.value = '';
+  }
+});
+
+
+document.getElementById('add-link-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+
+  const urls = getAllUrls(false);
+  const duplicateMatch = links.find(link => !link.is_separator && getLinkUrls(link).some(existingUrl => urls.some(url => normalizeUrl(existingUrl) === normalizeUrl(url))));
+  const isYoutubeTrackingEnabled = document.getElementById('link-youtube-tracking').checked;
+  const isClickTrackingEnabled = document.getElementById('link-click-tracking').checked;
+  const typeRadios = document.querySelectorAll('input[name="link-type"]');
+  let defaultType = 'text';
+  typeRadios.forEach(r => { if (r.checked) defaultType = r.value; });
+
+  const newLink = {
+    name: document.getElementById('link-name').value,
+    group: document.getElementById('link-group').value,
+    urls,
+    url: urls[0],
+    default_type: defaultType,
+    text: document.getElementById('link-text').value,
+    icon_class: document.getElementById('link-icon-class').value,
+    img_src: document.getElementById('link-img-src').value,
+    svg_code: document.getElementById('link-svg-code').value,
+    width: document.getElementById('link-width').value,
+    height: document.getElementById('link-height').value,
+    color: document.getElementById('link-color').value,
+    background_color: document.getElementById('link-background-color').value,
+    font_family: document.getElementById('link-font-family').value,
+    font_size: document.getElementById('link-font-size').value,
+    li_width: document.getElementById('link-li-width').value,
+    li_height: document.getElementById('link-li-height').value,
+    li_bg_color: document.getElementById('link-li-bg-color').value,
+    li_hover_color: document.getElementById('link-li-hover-color').value,
+    li_border_color: document.getElementById('link-li-border-color').value,
+    li_border_radius: document.getElementById('link-li-border-radius').value,
+    border_radius: document.getElementById('link-border-radius').value,
+    title: document.getElementById('link-title').value,
+    hidden: document.getElementById('link-hidden').checked,
+    start_new_line: document.getElementById('link-start-new-line').checked,
+    li_auto_fit: document.getElementById('link-li-auto-fit').checked,
+    li_auto_fit_scale: getAutoFitScaleValue('link'),
+    reminder_enabled: false,
+    note: document.getElementById('link-note').value,
+    note_enabled: document.getElementById('link-note-chip').checked,
+    folder_picker: document.getElementById('link-folder-picker').checked,
+    folder_path: document.getElementById('link-folder-path').value,
+    thumbnail_refresh_enabled: document.getElementById('link-thumbnail-refresh-enabled').checked
+  };
+
+  try {
+    if (isClickTrackingEnabled) {
+      newLink.click_tracking_enabled = true;
+      newLink.click_tracking_last_clicked_at = Date.now();
+      newLink.youtube_channel_id = undefined;
+      newLink.youtube_last_video_id = undefined;
+      newLink.youtube_new_video_count = 0;
+    } else if (isYoutubeTrackingEnabled) {
+      const trackingState = await initializeYouTubeTrackingForUrl(newLink.url);
+      if (trackingState.youtube_channel_id) {
+        Object.assign(newLink, compactObject(trackingState));
+        newLink.click_tracking_enabled = false;
+        newLink.click_tracking_last_clicked_at = 0;
+        window.showNotification('YouTube tracking enabled!', 'success');
+      } else {
+        window.showNotification('Could not find YouTube channel ID. Saved without tracking.', 'error');
+      }
+    } else {
+      newLink.click_tracking_enabled = false;
+      newLink.click_tracking_last_clicked_at = 0;
+    }
+
+    await window.convexMutation("functions:addLink", newLink);
+    document.getElementById('add-link-popup').classList.add('hidden');
+    document.getElementById('add-link-form').reset();
+    const addAutoFitRange = document.getElementById('link-li-auto-fit-scale');
+    if (addAutoFitRange) {
+      addAutoFitRange.dataset.autoFitTouched = '';
+    }
+    applyAutoFitScaleSettingsToControl('link', { resetToDefault: true });
+    await loadLinks();
+    if (duplicateMatch) {
+      window.showNotification(`Duplicate link added. Also exists in ${duplicateMatch.group || 'Ungrouped'}.`, 'error');
+    } else {
+      window.showNotification('Link added!');
+    }
+  } catch (error) {
+    console.error('Error adding link:', error);
+    alert('Error adding link: ' + error.message);
+  }
+});
+
+// Edit link popup
+function openEditLinkPopup(link, index) {
+  document.getElementById('edit-link-id').value = link._id;
+  document.getElementById('edit-link-name').value = link.name || '';
+  document.getElementById('edit-link-group').value = link.group || '';
+  currentReminderDraft = getReminderDraftFromLink(link);
+
+  // Populate URL fields
+  populateUrlFields(link.urls || [link.url], true);
+
+  document.getElementById('edit-link-text').value = link.text || '';
+  document.getElementById('edit-link-icon-class').value = link.icon_class || '';
+  document.getElementById('edit-link-img-src').value = link.img_src || '';
+  document.getElementById('edit-link-svg-code').value = link.svg_code || '';
+  document.getElementById('edit-link-width').value = link.width || '';
+  document.getElementById('edit-link-height').value = link.height || '';
+  document.getElementById('edit-link-color').value = link.color || '';
+  document.getElementById('edit-link-background-color').value = link.background_color || '';
+  document.getElementById('edit-link-font-family').value = link.font_family || '';
+  document.getElementById('edit-link-font-size').value = link.font_size || '';
+  document.getElementById('edit-link-li-width').value = link.li_width || '';
+  document.getElementById('edit-link-li-height').value = link.li_height || '';
+  document.getElementById('edit-link-li-bg-color').value = link.li_bg_color || '';
+  document.getElementById('edit-link-li-hover-color').value = link.li_hover_color || '';
+  document.getElementById('edit-link-li-border-color').value = link.li_border_color || '';
+  document.getElementById('edit-link-li-border-radius').value = link.li_border_radius || '';
+  document.getElementById('edit-link-border-radius').value = link.border_radius || '';
+  document.getElementById('edit-link-title').value = link.title || '';
+  document.getElementById('edit-link-hidden').checked = link.hidden || false;
+  document.getElementById('edit-link-start-new-line').checked = link.start_new_line || false;
+  document.getElementById('edit-link-li-auto-fit').checked = link.li_auto_fit || false;
+  {
+    const autoFitScale = parseAutoFitScale(link.li_auto_fit_scale);
+    const range = document.getElementById('edit-link-li-auto-fit-scale');
+    const display = document.getElementById('edit-link-li-auto-fit-scale-value');
+    range.value = autoFitScale.toFixed(2);
+    updateAutoFitScaleVisual(range, display, autoFitScale);
+  }
+  document.getElementById('edit-link-youtube-tracking').checked = !!link.youtube_channel_id;
+  document.getElementById('edit-link-click-tracking').checked = !!link.click_tracking_enabled;
+  const noteChip = document.getElementById('edit-link-note-chip');
+  const noteInput = document.getElementById('edit-link-note-input');
+  noteChip.checked = !!link.note_enabled;
+  noteInput.style.display = 'none';
+  document.getElementById('edit-link-note').value = link.note || '';
+  document.getElementById('edit-link-folder-picker').checked = !!link.folder_picker;
+  const folderPathInput = document.getElementById('edit-link-folder-path-input');
+  folderPathInput.style.display = 'none';
+  document.getElementById('edit-link-folder-path').value = link.folder_path || '';
+  updateFolderChipColor('edit-link-folder-path', 'edit-link-folder-picker');
+  document.getElementById('edit-link-thumbnail-refresh-enabled').checked = !!link.thumbnail_refresh_enabled;
+
+  const typeRadios = document.querySelectorAll('input[name="edit-link-type"]');
+  typeRadios.forEach(r => r.checked = r.value === link.default_type);
+
+  const svgTextarea = document.getElementById('edit-link-svg-code');
+  svgTextarea.style.display = link.default_type === 'svg' ? 'block' : 'none';
+  syncAutoFitScaleControls('edit-link');
+
+  updateEditReminderSummary();
+  document.getElementById('edit-link-popup').classList.remove('hidden');
+
+  // Apply color preview to all color fields
+  setTimeout(() => {
+    if (typeof applyColorPreviewToContainer === 'function') {
+      applyColorPreviewToContainer(document.getElementById('edit-link-popup'));
+    }
+  }, 50);
+}
+
+document.getElementById('edit-link-youtube-tracking').addEventListener('change', (e) => {
+  if (e.target.checked) {
+    document.getElementById('edit-link-click-tracking').checked = false;
+  }
+});
+
+document.getElementById('edit-link-click-tracking').addEventListener('change', (e) => {
+  if (e.target.checked) {
+    document.getElementById('edit-link-youtube-tracking').checked = false;
+  }
+});
+
+document.getElementById('edit-link-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+
+  const id = document.getElementById('edit-link-id').value;
+  const urls = getAllUrls(true);
+  const typeRadios = document.querySelectorAll('input[name="edit-link-type"]');
+  let defaultType = 'text';
+  typeRadios.forEach(r => { if (r.checked) defaultType = r.value; });
+  const { reminder: reminderDraft, skipped: reminderSkipped } = getOptionalReminderDraft(currentReminderDraft || {});
+
+  const updatedLink = {
+    id,
+    name: document.getElementById('edit-link-name').value,
+    group: document.getElementById('edit-link-group').value,
+    urls,
+    url: urls[0],
+    default_type: defaultType,
+    text: document.getElementById('edit-link-text').value,
+    icon_class: document.getElementById('edit-link-icon-class').value,
+    img_src: document.getElementById('edit-link-img-src').value,
+    svg_code: document.getElementById('edit-link-svg-code').value,
+    width: document.getElementById('edit-link-width').value,
+    height: document.getElementById('edit-link-height').value,
+    color: document.getElementById('edit-link-color').value,
+    background_color: document.getElementById('edit-link-background-color').value,
+    font_family: document.getElementById('edit-link-font-family').value,
+    font_size: document.getElementById('edit-link-font-size').value,
+    li_width: document.getElementById('edit-link-li-width').value,
+    li_height: document.getElementById('edit-link-li-height').value,
+    li_bg_color: document.getElementById('edit-link-li-bg-color').value,
+    li_hover_color: document.getElementById('edit-link-li-hover-color').value,
+    li_border_color: document.getElementById('edit-link-li-border-color').value,
+    li_border_radius: document.getElementById('edit-link-li-border-radius').value,
+    border_radius: document.getElementById('edit-link-border-radius').value,
+    title: document.getElementById('edit-link-title').value,
+    hidden: document.getElementById('edit-link-hidden').checked,
+    start_new_line: document.getElementById('edit-link-start-new-line').checked,
+    li_auto_fit: document.getElementById('edit-link-li-auto-fit').checked,
+    li_auto_fit_scale: getAutoFitScaleValue('edit-link'),
+    note: document.getElementById('edit-link-note').value,
+    note_enabled: document.getElementById('edit-link-note-chip').checked,
+    folder_picker: document.getElementById('edit-link-folder-picker').checked,
+    folder_path: document.getElementById('edit-link-folder-path').value,
+    thumbnail_refresh_enabled: document.getElementById('edit-link-thumbnail-refresh-enabled').checked,
+    ...compactObject(reminderDraft)
+  };
+
+  const isYoutubeTrackingEnabled = document.getElementById('edit-link-youtube-tracking').checked;
+  const isClickTrackingEnabled = document.getElementById('edit-link-click-tracking').checked;
+  const originalLink = links.find(l => l._id === id);
+
+  if (isClickTrackingEnabled) {
+    updatedLink.click_tracking_enabled = true;
+    updatedLink.click_tracking_last_clicked_at = originalLink.click_tracking_enabled ? (originalLink.click_tracking_last_clicked_at || Date.now()) : Date.now();
+    updatedLink.youtube_channel_id = "";
+    updatedLink.youtube_last_video_id = "";
+    updatedLink.youtube_new_video_count = 0;
+  } else if (isYoutubeTrackingEnabled) {
+    const needsInitialization = !originalLink.youtube_channel_id || !originalLink.youtube_last_video_id;
+
+    updatedLink.click_tracking_enabled = false;
+    updatedLink.click_tracking_last_clicked_at = 0;
+
+    if (needsInitialization) {
+      try {
+        window.showNotification('Initializing YouTube tracking...', 'info');
+        const trackingState = await initializeYouTubeTrackingForUrl(updatedLink.url, originalLink.youtube_channel_id);
+        if (trackingState.youtube_channel_id) {
+          updatedLink.youtube_channel_id = trackingState.youtube_channel_id;
+          updatedLink.youtube_last_video_id = trackingState.youtube_last_video_id || "";
+          updatedLink.youtube_new_video_count = originalLink.youtube_new_video_count || 0;
+          window.showNotification('YouTube tracking enabled!', 'success');
+        } else {
+          updatedLink.youtube_channel_id = "";
+          updatedLink.youtube_last_video_id = "";
+          updatedLink.youtube_new_video_count = 0;
+          window.showNotification('Could not find YouTube channel ID. Tracking left off.', 'error');
+        }
+      } catch (error) {
+        console.error('Error initializing YouTube tracking during save:', error);
+        updatedLink.youtube_channel_id = "";
+        updatedLink.youtube_last_video_id = "";
+        updatedLink.youtube_new_video_count = 0;
+      }
+    } else {
+      updatedLink.youtube_channel_id = originalLink.youtube_channel_id;
+      updatedLink.youtube_last_video_id = originalLink.youtube_last_video_id;
+      updatedLink.youtube_new_video_count = originalLink.youtube_new_video_count;
+      updatedLink.youtube_notification_started_at = originalLink.youtube_notification_started_at || 0;
+    }
+  } else {
+    // Clear tracking
+    updatedLink.click_tracking_enabled = false;
+    updatedLink.click_tracking_last_clicked_at = 0;
+    updatedLink.youtube_channel_id = "";
+    updatedLink.youtube_last_video_id = "";
+    updatedLink.youtube_new_video_count = 0;
+  }
+
+  try {
+    await window.convexMutation("functions:updateLink", updatedLink);
+    document.getElementById('edit-link-popup').classList.add('hidden');
+    await loadLinks();
+    if (reminderSkipped) {
+      currentReminderDraft = reminderDraft;
+      updateEditReminderSummary();
+      window.showNotification('Link updated. Reminder was skipped.', 'info');
+    } else {
+      window.showNotification('Link updated!');
+    }
+  } catch (error) {
+    console.error('Error updating link:', error);
+    alert('Error updating link: ' + error.message);
+  }
+});
+
+document.getElementById('edit-link-reminder-button').addEventListener('click', () => {
+  openReminderPopup();
+});
+
+document.getElementById('reminder-mode').addEventListener('change', () => {
+  updateReminderModeUI();
+  updateReminderStatus();
+});
+
+document.getElementById('reminder-frequency').addEventListener('change', updateReminderStatus);
+document.getElementById('reminder-enabled').addEventListener('change', () => {
+  updateReminderModeUI();
+  updateReminderStatus();
+});
+document.getElementById('reminder-interval-days').addEventListener('input', updateReminderStatus);
+document.getElementById('reminder-datetime').addEventListener('change', updateReminderStatus);
+
+document.getElementById('reminder-reset-due').addEventListener('click', () => {
+  resetReminderFromPopup();
+});
+
+document.getElementById('reminder-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const { reminder: reminderDraft, skipped: reminderSkipped } = getOptionalReminderDraft(collectReminderFormDraft());
+  currentReminderDraft = reminderDraft;
+  updateEditReminderSummary();
+  document.getElementById('reminder-popup').classList.add('hidden');
+  if (reminderSkipped) {
+    window.showNotification('Reminder not set. Link can be saved without it.', 'info');
+  }
+});
+
+// Delete link
+async function deleteLink(id) {
+  if (!confirm('Delete this link?')) return;
+
+  try {
+    await window.convexMutation("functions:deleteLink", { id });
+    await loadLinks();
+    window.showNotification('Link deleted!');
+  } catch (error) {
+    console.error('Error deleting link:', error);
+    alert('Error deleting link: ' + error.message);
+  }
+}
+
+// Copy link
+async function copyLink(link) {
+  const { _id, _creationTime, ...newLink } = link;
+  newLink.name = (newLink.name || '') + ' (Copy)';
+
+  try {
+    await window.convexMutation("functions:addLink", newLink);
+    await loadLinks();
+    window.showNotification('Link copied!');
+  } catch (error) {
+    console.error('Error copying link:', error);
+    alert('Error copying link: ' + error.message);
+  }
+}
+
+// Reorder links
+async function reorderLinks(fromIndex, toIndex) {
+  const newLinks = [...links];
+  const [moved] = newLinks.splice(fromIndex, 1);
+  newLinks.splice(toIndex, 0, moved);
+
+  // Normalize group props: all items in a group must share the same group-level fields.
+  // After a reorder, _creationTime is reassigned in flat array order, changing which item
+  // becomes items[0] (the source of truth for group styling/order). We fix this by copying
+  // the canonical group props (from whichever item has the most set) to all group members.
+  const GROUP_PROPS = ['collapsible','box_group','horizontal_stack','display_style',
+    'group_order','group_start_new_line','top_name','top_bg_color','top_text_color',
+    'top_border_color','top_hover_color','top_width','top_height','top_font_family',
+    'top_font_size','popup_bg_color','popup_text_color','popup_border_color',
+    'popup_border_radius','horizontal_bg_color','horizontal_text_color',
+    'horizontal_border_color','horizontal_hover_color','password_protect','group_password'];
+
+  const byGroup = {};
+  newLinks.forEach(l => {
+    const g = l.group || 'Ungrouped';
+    (byGroup[g] = byGroup[g] || []).push(l);
+  });
+  for (const items of Object.values(byGroup)) {
+    const canonical = items.reduce((best, item) => {
+      const score = p => GROUP_PROPS.filter(k => item[k] !== undefined && item[k] !== '').length;
+      return score(item) > score(best) ? item : best;
+    });
+    const props = Object.fromEntries(GROUP_PROPS.filter(p => canonical[p] !== undefined).map(p => [p, canonical[p]]));
+    items.forEach(item => Object.assign(item, props));
+  }
+
+  try {
+    await window.convexMutation("functions:updateAllLinks", { links: newLinks });
+    await loadLinks();
+  } catch (error) {
+    console.error('Error reordering:', error);
+    alert('Error reordering: ' + error.message);
+  }
+}
+
+// Edit group popup
+function openEditGroupPopup(groupName) {
+  const groupLinks = links.filter(l => (l.group || 'Ungrouped') === groupName);
+  const firstLink = groupLinks[0] || {};
+
+  document.getElementById('edit-group-original-name').value = groupName;
+  document.getElementById('edit-group-name').value = groupName;
+  document.getElementById('edit-group-top-name').value = firstLink.top_name || '';
+  document.getElementById('edit-group-password-protect').checked = firstLink.password_protect || false;
+  const pwdInput = document.getElementById('edit-group-password-value');
+  if (pwdInput) {
+    pwdInput.value = firstLink.group_password || '';
+    pwdInput.style.display = firstLink.password_protect ? 'block' : 'none';
+  }
+  // Store originals for change detection
+  let origPwdProtect = document.getElementById('edit-group-original-password-protect');
+  if (!origPwdProtect) { origPwdProtect = document.createElement('input'); origPwdProtect.type = 'hidden'; origPwdProtect.id = 'edit-group-original-password-protect'; document.getElementById('edit-group-form').appendChild(origPwdProtect); }
+  origPwdProtect.value = firstLink.password_protect || false;
+  let origPwdVal = document.getElementById('edit-group-original-password-value');
+  if (!origPwdVal) { origPwdVal = document.createElement('input'); origPwdVal.type = 'hidden'; origPwdVal.id = 'edit-group-original-password-value'; document.getElementById('edit-group-form').appendChild(origPwdVal); }
+  origPwdVal.value = firstLink.group_password || '';
+  document.getElementById('edit-group-group-start-new-line').checked = firstLink.group_start_new_line || false;
+
+  // Set group type radio
+  const typeRadios = document.querySelectorAll('input[name="edit-group-type"]');
+  let groupType = 'horizontal';
+  if (firstLink.collapsible) groupType = 'top';
+  else if (firstLink.box_group) groupType = 'box';
+  else if (firstLink.horizontal_stack) groupType = 'horizontal';
+  typeRadios.forEach(r => r.checked = r.value === groupType);
+  let origGroupType = document.getElementById('edit-group-original-type');
+  if (!origGroupType) { origGroupType = document.createElement('input'); origGroupType.type = 'hidden'; origGroupType.id = 'edit-group-original-type'; document.getElementById('edit-group-form').appendChild(origGroupType); }
+  origGroupType.value = groupType;
+
+  const displayRadios = document.querySelectorAll('input[name="edit-group-display"]');
+  displayRadios.forEach(r => r.checked = r.value === (firstLink.display_style || 'flex'));
+
+  document.getElementById('edit-group-top-bg-color').value = firstLink.top_bg_color || '';
+  document.getElementById('edit-group-top-text-color').value = firstLink.top_text_color || '';
+  document.getElementById('edit-group-top-border-color').value = firstLink.top_border_color || '';
+  document.getElementById('edit-group-top-hover-color').value = firstLink.top_hover_color || '';
+  document.getElementById('edit-group-top-width').value = firstLink.top_width || '';
+  document.getElementById('edit-group-top-height').value = firstLink.top_height || '';
+  document.getElementById('edit-group-top-font-family').value = firstLink.top_font_family || '';
+  document.getElementById('edit-group-top-font-size').value = firstLink.top_font_size || '';
+  document.getElementById('edit-group-popup-bg-color').value = firstLink.popup_bg_color || '';
+  document.getElementById('edit-group-popup-text-color').value = firstLink.popup_text_color || '';
+  document.getElementById('edit-group-popup-border-color').value = firstLink.popup_border_color || '';
+  document.getElementById('edit-group-popup-border-radius').value = firstLink.popup_border_radius || '';
+  document.getElementById('edit-group-horizontal-bg-color').value = firstLink.horizontal_bg_color || '';
+  document.getElementById('edit-group-horizontal-text-color').value = firstLink.horizontal_text_color || '';
+  document.getElementById('edit-group-horizontal-border-color').value = firstLink.horizontal_border_color || '';
+  document.getElementById('edit-group-horizontal-hover-color').value = firstLink.horizontal_hover_color || '';
+
+  document.getElementById('edit-group-popup').classList.remove('hidden');
+
+  // Show/hide sections based on type
+  updateGroupTypeSettings(groupType);
+
+  // Apply color preview to all color fields
+  setTimeout(() => {
+    if (typeof applyColorPreviewToContainer === 'function') {
+      applyColorPreviewToContainer(document.getElementById('edit-group-popup'));
+    }
+  }, 50);
+}
+
+function updateGroupTypeSettings(type) {
+  // Show all settings for all types
+  document.getElementById('collapsible-settings').style.display = 'block';
+  document.getElementById('horizontal-settings').style.display = 'block';
+}
+
+document.querySelectorAll('input[name="edit-group-type"]').forEach(radio => {
+  radio.addEventListener('change', (e) => {
+    updateGroupTypeSettings(e.target.value);
+  });
+});
+
+document.getElementById('edit-group-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+
+  // Require master password if group type changed on a password-protected group
+  const currentProtect = document.getElementById('edit-group-password-protect').checked;
+  const origType = document.getElementById('edit-group-original-type')?.value || 'horizontal';
+  let currentType = 'horizontal';
+  document.querySelectorAll('input[name="edit-group-type"]').forEach(r => { if (r.checked) currentType = r.value; });
+  if (currentProtect && currentType !== origType) {
+    const typeAttempt = await window.promptPassword('Enter master password to change group type:');
+    if (typeAttempt !== '182358') {
+      window.showNotification('Incorrect master password', 'error');
+      return;
+    }
+  }
+
+  // Only require master password if password protection settings changed
+  const origProtect = document.getElementById('edit-group-original-password-protect')?.value === 'true';
+  const origPwd = document.getElementById('edit-group-original-password-value')?.value || '';
+  const newProtect = document.getElementById('edit-group-password-protect').checked;
+  const newPwd = document.getElementById('edit-group-password-value')?.value || '';
+  if (newProtect !== origProtect || newPwd !== origPwd) {
+    const masterAttempt = await window.promptPassword('Enter master password to change password settings:');
+    if (masterAttempt !== '182358') {
+      window.showNotification('Incorrect master password', 'error');
+      return;
+    }
+  }
+
+  const originalName = document.getElementById('edit-group-original-name').value;
+  const newName = document.getElementById('edit-group-name').value;
+
+  const displayRadios = document.querySelectorAll('input[name="edit-group-display"]');
+  let displayStyle = 'flex';
+  displayRadios.forEach(r => { if (r.checked) displayStyle = r.value; });
+
+  // Get group type from radio buttons
+  const typeRadios = document.querySelectorAll('input[name="edit-group-type"]');
+  let groupType = 'horizontal';
+  typeRadios.forEach(r => { if (r.checked) groupType = r.value; });
+
+  const groupSettings = {
+    collapsible: groupType === 'top',
+    box_group: groupType === 'box',
+    horizontal_stack: groupType === 'horizontal',
+    display_style: displayStyle,
+    password_protect: document.getElementById('edit-group-password-protect').checked,
+    group_password: document.getElementById('edit-group-password-value')?.value || undefined,
+    group_start_new_line: document.getElementById('edit-group-group-start-new-line').checked,
+    top_name: document.getElementById('edit-group-top-name').value,
+    top_bg_color: document.getElementById('edit-group-top-bg-color').value,
+    top_text_color: document.getElementById('edit-group-top-text-color').value,
+    top_border_color: document.getElementById('edit-group-top-border-color').value,
+    top_hover_color: document.getElementById('edit-group-top-hover-color').value,
+    top_width: document.getElementById('edit-group-top-width').value,
+    top_height: document.getElementById('edit-group-top-height').value,
+    top_font_family: document.getElementById('edit-group-top-font-family').value,
+    top_font_size: document.getElementById('edit-group-top-font-size').value,
+    popup_bg_color: document.getElementById('edit-group-popup-bg-color').value,
+    popup_text_color: document.getElementById('edit-group-popup-text-color').value,
+    popup_border_color: document.getElementById('edit-group-popup-border-color').value,
+    popup_border_radius: document.getElementById('edit-group-popup-border-radius').value,
+    horizontal_bg_color: document.getElementById('edit-group-horizontal-bg-color').value,
+    horizontal_text_color: document.getElementById('edit-group-horizontal-text-color').value,
+    horizontal_border_color: document.getElementById('edit-group-horizontal-border-color').value,
+    horizontal_hover_color: document.getElementById('edit-group-horizontal-hover-color').value
+  };
+
+  try {
+    const updatedLinks = links.map(link => {
+      if ((link.group || 'Ungrouped') === originalName) {
+        return { ...link, group: newName, ...groupSettings };
+      }
+      return link;
+    });
+
+    await window.convexMutation("functions:updateAllLinks", { links: updatedLinks });
+
+    // Update open popup name if it matches the edited group
+    const popupTitle = document.querySelector('#group_type_box-popup h3');
+    if (popupTitle && popupTitle.dataset.groupName === originalName) {
+      popupTitle.dataset.groupName = newName;
+    }
+
+    document.getElementById('edit-group-popup').classList.add('hidden');
+    await loadLinks();
+    window.showNotification('Group updated!');
+  } catch (error) {
+    console.error('Error updating group:', error);
+    alert('Error updating group: ' + error.message);
+  }
+});
+
+// Delete group
+async function deleteGroup(groupName) {
+  if (!confirm(`Delete group "${groupName}" and all its links?`)) return;
+
+  try {
+    const remaining = links.filter(l => (l.group || 'Ungrouped') !== groupName);
+    await window.convexMutation("functions:updateAllLinks", { links: remaining });
+    await loadLinks();
+    window.showNotification('Group deleted!');
+  } catch (error) {
+    console.error('Error deleting group:', error);
+    alert('Error deleting group: ' + error.message);
+  }
+}
+
+// Duplicate group
+async function duplicateGroup(groupName) {
+  const groupLinks = links.filter(l => (l.group || 'Ungrouped') === groupName);
+  if (groupLinks.length === 0) return;
+
+  const newGroupName = groupName + ' (Copy)';
+  const duplicatedLinks = groupLinks.map(link => {
+    const { _id, _creationTime, ...newLink } = link;
+    newLink.group = newGroupName;
+    return newLink;
+  });
+
+  try {
+    for (const link of duplicatedLinks) {
+      await window.convexMutation("functions:addLink", link);
+    }
+    await loadLinks();
+    window.showNotification('Group duplicated!');
+  } catch (error) {
+    console.error('Error duplicating group:', error);
+    alert('Error duplicating group: ' + error.message);
+  }
+}
+
+// SVG textarea toggle
+document.querySelectorAll('input[name="link-type"]').forEach(radio => {
+  radio.addEventListener('change', () => {
+    document.getElementById('link-svg-code').style.display = radio.value === 'svg' ? 'block' : 'none';
+  });
+});
+
+document.querySelectorAll('input[name="edit-link-type"]').forEach(radio => {
+  radio.addEventListener('change', () => {
+    document.getElementById('edit-link-svg-code').style.display = radio.value === 'svg' ? 'block' : 'none';
+  });
+});
+
+// URL field management
+// URL field management
+function createUrlInputGroup(url = '', runHidden = false, isEdit = false, isFirst = false) {
+  const group = document.createElement('div');
+  group.className = 'url-input-group';
+  group.style.display = 'flex';
+  group.style.alignItems = 'center';
+  group.style.gap = '5px';
+
+  const input = document.createElement('input');
+  input.type = 'url';
+  input.className = 'url-input';
+  input.placeholder = 'URL';
+  input.value = url;
+  input.style.flex = '1';
+  if (isFirst) input.required = true;
+
+  input.addEventListener('input', () => {
+    updateFallbackDropdown(isEdit);
+  });
+
+  const toggleWrapper = document.createElement('label');
+  toggleWrapper.className = 'inline-chip';
+  toggleWrapper.title = 'Run Hidden (pythonw for python files, etc.)';
+
+  const checkbox = document.createElement('input');
+  checkbox.type = 'checkbox';
+  checkbox.className = 'run-hidden-checkbox';
+  checkbox.checked = runHidden;
+
+  const chipBody = document.createElement('span');
+  chipBody.className = 'inline-chip-body';
+  chipBody.innerHTML = `
+    <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor">
+      <path d="M12 7c2.76 0 5 2.24 5 5 0 .65-.13 1.26-.36 1.82l2.92 2.92c1.51-1.26 2.7-2.89 3.44-4.74-1.73-4.39-6-7.5-11-7.5-1.4 0-2.74.25-3.98.7l2.16 2.16C10.74 7.13 11.35 7 12 7zM2 4.27l2.28 2.28.46.46C3.08 8.3 1.78 10.02 1 12c1.73 4.39 6 7.5 11 7.5 1.55 0 3.03-.3 4.38-.84l.42.42L19.73 22 21 20.73 3.27 3 2 4.27zM7.53 9.8l1.55 1.55c-.05.21-.08.43-.08.65 0 1.66 1.34 3 3 3 .22 0 .44-.03.65-.08l1.55 1.55c-.67.33-1.41.53-2.2.53-2.76 0-5-2.24-5-5 0-.79.2-1.53.53-2.2zm4.31-.78 3.15 3.15.02-.16c0-1.66-1.34-3-3-3l-.17.01z"/>
+    </svg>
+  `;
+
+  toggleWrapper.appendChild(checkbox);
+  toggleWrapper.appendChild(chipBody);
+
+  group.appendChild(input);
+  group.appendChild(toggleWrapper);
+
+  if (isFirst) {
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.textContent = '+';
+    addBtn.onclick = isEdit ? window.addEditUrlField : window.addUrlField;
+    group.appendChild(addBtn);
+  } else {
+    const removeBtn = document.createElement('button');
+    removeBtn.type = 'button';
+    removeBtn.className = 'remove-btn';
+    removeBtn.textContent = '−';
+    removeBtn.onclick = () => {
+      group.remove();
+      updateFallbackDropdown(isEdit);
+    };
+    group.appendChild(removeBtn);
+  }
+
+  return group;
+}
+
+function updateFallbackDropdown(isEdit) {
+  const container = document.getElementById(isEdit ? 'edit-urls-container' : 'urls-container');
+  const select = document.getElementById(isEdit ? 'edit-link-fallback-select' : 'link-fallback-select');
+  if (!select) return;
+
+  const currentVal = select.value;
+  select.innerHTML = '<option value="">No Fallback</option>';
+
+  const groups = container.querySelectorAll('.url-input-group');
+  groups.forEach((group, index) => {
+    if (index === 0) return; // Skip primary URL
+    const input = group.querySelector('.url-input');
+    const labelText = input && input.value.trim() ? input.value.trim() : `URL ${index + 1}`;
+    
+    // Truncate label text to keep it neat
+    const truncatedLabel = labelText.length > 30 ? labelText.slice(0, 27) + '...' : labelText;
+
+    const option = document.createElement('option');
+    option.value = String(index);
+    option.textContent = `Run ${truncatedLabel} on fail`;
+    select.appendChild(option);
+  });
+
+  // Restore previous selection if still valid
+  if (Array.from(select.options).some(o => o.value === currentVal)) {
+    select.value = currentVal;
+  }
+}
+
+window.addUrlField = () => {
+  const container = document.getElementById('urls-container');
+  const group = createUrlInputGroup('', false, false, false);
+  container.appendChild(group);
+  updateFallbackDropdown(false);
+};
+
+window.addEditUrlField = () => {
+  const container = document.getElementById('edit-urls-container');
+  const group = createUrlInputGroup('', false, true, false);
+  container.appendChild(group);
+  updateFallbackDropdown(true);
+};
+
+function getAllUrls(isEdit = false) {
+  const container = document.getElementById(isEdit ? 'edit-urls-container' : 'urls-container');
+  const groups = container.querySelectorAll('.url-input-group');
+  const select = document.getElementById(isEdit ? 'edit-link-fallback-select' : 'link-fallback-select');
+  const selectedFallbackIndex = select ? select.value : "";
+
+  return Array.from(groups).map((group, index) => {
+    const input = group.querySelector('.url-input');
+    if (!input) return null;
+    let val = input.value.trim();
+    if (!val) return null;
+    
+    // Process run_hidden checkbox
+    const checkbox = group.querySelector('.run-hidden-checkbox');
+    if (checkbox && checkbox.checked) {
+      try {
+        const urlObj = new URL(val);
+        urlObj.searchParams.set('run_hidden', 'true');
+        val = urlObj.toString();
+      } catch (e) {
+        if (val.includes('?')) {
+          val += '&run_hidden=true';
+        } else {
+          val += '?run_hidden=true';
+        }
+      }
+    }
+
+    // Process fallback
+    if (selectedFallbackIndex && String(index) === selectedFallbackIndex) {
+      try {
+        const urlObj = new URL(val);
+        urlObj.searchParams.set('fallback', 'true');
+        val = urlObj.toString();
+      } catch (e) {
+        if (val.includes('?')) {
+          val += '&fallback=true';
+        } else {
+          val += '?fallback=true';
+        }
+      }
+    }
+
+    return val;
+  }).filter(Boolean);
+}
+
+function populateUrlFields(urls, isEdit = false) {
+  const container = document.getElementById(isEdit ? 'edit-urls-container' : 'urls-container');
+  container.innerHTML = '';
+
+  if (!urls || urls.length === 0) urls = [''];
+
+  let fallbackIndex = "";
+
+  urls.forEach((url, index) => {
+    let baseUrl = url;
+    let runHidden = false;
+    let isFallback = false;
+    
+    if (url) {
+      try {
+        const urlObj = new URL(url);
+        if (urlObj.searchParams.get('run_hidden') === 'true') {
+          runHidden = true;
+          urlObj.searchParams.delete('run_hidden');
+        }
+        if (urlObj.searchParams.get('fallback') === 'true') {
+          isFallback = true;
+          urlObj.searchParams.delete('fallback');
+        }
+        baseUrl = urlObj.toString();
+        if (baseUrl.endsWith('?')) {
+          baseUrl = baseUrl.slice(0, -1);
+        }
+      } catch (e) {
+        if (url.includes('run_hidden=true')) {
+          runHidden = true;
+          baseUrl = url.replace(/[?&]run_hidden=true/, '');
+        }
+        if (url.includes('fallback=true')) {
+          isFallback = true;
+          baseUrl = url.replace(/[?&]fallback=true/, '');
+        }
+      }
+    }
+
+    if (isFallback) {
+      fallbackIndex = String(index);
+    }
+
+    const group = createUrlInputGroup(baseUrl, runHidden, isEdit, index === 0);
+    container.appendChild(group);
+  });
+
+  updateFallbackDropdown(isEdit);
+  
+  const select = document.getElementById(isEdit ? 'edit-link-fallback-select' : 'link-fallback-select');
+  if (select) {
+    select.value = fallbackIndex;
+  }
+  
+  const fallbackChip = document.getElementById(isEdit ? 'edit-link-fallback-chip' : 'link-fallback-chip');
+  if (fallbackChip) {
+    fallbackChip.checked = (fallbackIndex !== "");
+  }
+  const inputDiv = document.getElementById(isEdit ? 'edit-link-fallback-input' : 'link-fallback-input');
+  if (inputDiv) {
+    inputDiv.style.display = 'none';
+  }
+}
+
+// Edit mode listener
+document.addEventListener('editModeChanged', loadLinks);
+
+// Note edit modal
+function openNoteEditPopup(link) {
+  const popup = document.getElementById('note-edit-popup');
+  const textarea = document.getElementById('note-edit-textarea');
+  textarea.value = link.note || '';
+  popup.classList.remove('hidden');
+  setTimeout(() => textarea.focus(), 50);
+
+  const saveBtn = document.getElementById('note-edit-save');
+  const clearBtn = document.getElementById('note-edit-clear');
+
+  function cleanup() {
+    saveBtn.onclick = null;
+    clearBtn.onclick = null;
+  }
+
+  saveBtn.onclick = async () => {
+    const note = textarea.value.trim();
+    await window.convexMutation('functions:updateLink', { id: link._id, note });
+    await loadLinks();
+    popup.classList.add('hidden');
+    cleanup();
+    window.showNotification('Note saved!', 'success');
+  };
+
+  clearBtn.onclick = async () => {
+    await window.convexMutation('functions:updateLink', { id: link._id, note: '' });
+    await loadLinks();
+    popup.classList.add('hidden');
+    cleanup();
+    window.showNotification('Note cleared.', 'success');
+  };
+}
+
+window.loadLinks = loadLinks;
+window.openEditLinkPopup = openEditLinkPopup;
+window.openEditGroupPopup = openEditGroupPopup;
+window.deleteLink = deleteLink;
+window.deleteGroup = deleteGroup;
+window.duplicateGroup = duplicateGroup;
+window.copyLink = copyLink;
+window.reorderLinks = reorderLinks;
+
+// Fallback initialization if app.js fails
+document.addEventListener('DOMContentLoaded', () => {
+  console.log('🔵 DOMContentLoaded fired in links-handler.js');
+
+  if (!window.convexClient) {
+    console.warn('Convex client not initialized (app.js failed?), running fallback...');
+    loadLinks();
+  }
+
+  // EMERGENCY: Force create FAB after 2 seconds if it doesn't exist
+  setTimeout(() => {
+    console.log('🔵 Checking if FAB exists...');
+
+    const fab = document.getElementById('fab-add-link');
+
+    if (!fab) {
+      console.warn('⚠️ FAB not found! Creating emergency FAB...');
+      const emergencyFab = document.createElement('button');
+      emergencyFab.id = 'fab-add-link';
+      emergencyFab.innerHTML = '+';
+      emergencyFab.title = 'Add New Link';
+      emergencyFab.style.position = 'fixed';
+      emergencyFab.style.bottom = '30px';
+      emergencyFab.style.right = '30px';
+      emergencyFab.style.width = '60px';
+      emergencyFab.style.height = '60px';
+      emergencyFab.style.borderRadius = '50%';
+      emergencyFab.style.background = '#4CAF50';
+      emergencyFab.style.color = 'white';
+      emergencyFab.style.border = 'none';
+      emergencyFab.style.fontSize = '32px';
+      emergencyFab.style.cursor = 'pointer';
+      emergencyFab.style.boxShadow = '0 4px 12px rgba(0,0,0,0.5)';
+      emergencyFab.style.zIndex = '1000';
+      emergencyFab.style.display = 'flex';
+      emergencyFab.style.alignItems = 'center';
+      emergencyFab.style.justifyContent = 'center';
+      emergencyFab.onclick = () => showAddLinkPopup();
+      document.body.appendChild(emergencyFab);
+      console.log('✅ Emergency FAB created!');
+    } else {
+      console.log('✅ FAB exists!');
+    }
+  }, 2000);
+});
+
+// Group drag and drop
+let draggedGroup = null;
+
+function handleGroupDragStart(e) {
+  draggedGroup = e.currentTarget;
+  draggedGroup.classList.add('dragging');
+  e.dataTransfer.effectAllowed = 'move';
+}
+
+function handleGroupDragOver(e) {
+  if (!draggedGroup) return; // Only groups react to groups
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+  const target = e.currentTarget;
+  if (target !== draggedGroup && (target.classList.contains('group_type_top') || target.classList.contains('group_type_box') || target.classList.contains('link-group'))) {
+    // For groups, we use horizontal detection as they are usually side-by-side
+    const rect = target.getBoundingClientRect();
+    const isBefore = e.clientX < rect.left + rect.width / 2;
+    
+    target.classList.remove('drag-over-before', 'drag-over-after');
+    if (isBefore) {
+      target.classList.add('drag-over-before');
+    } else {
+      target.classList.add('drag-over-after');
+    }
+  }
+}
+
+function handleGroupDrop(e) {
+  if (!draggedGroup) return;
+  e.preventDefault();
+  e.stopPropagation();
+  const target = e.currentTarget;
+  const isBefore = target.classList.contains('drag-over-before');
+  target.classList.remove('drag-over-before', 'drag-over-after');
+
+  if (draggedGroup && draggedGroup !== target) {
+    if (isBefore) {
+      target.parentNode.insertBefore(draggedGroup, target);
+    } else {
+      target.parentNode.insertBefore(draggedGroup, target.nextSibling);
+    }
+
+    // Save new group order after DOM updates
+    setTimeout(() => saveGroupOrder(), 300);
+  }
+}
+
+function handleGroupDragEnd(e) {
+  e.currentTarget.classList.remove('dragging');
+  document.querySelectorAll('.drag-over-before, .drag-over-after').forEach(el => {
+    el.classList.remove('drag-over-before', 'drag-over-after');
+  });
+  draggedGroup = null;
+}
+
+async function saveGroupOrder() {
+  try {
+    // Get all groups in their actual DOM order
+    const container = document.getElementById('links-container');
+    const allGroups = [];
+
+    // Iterate through all children in order
+    Array.from(container.children).forEach(child => {
+      if (child.classList.contains('group_type_top-container')) {
+        // Get all groups from inside top container (even if a regular group was dragged there)
+        const innerGroups = Array.from(child.children).filter(c => c.dataset.groupName);
+        allGroups.push(...innerGroups);
+      } else if (child.dataset.groupName) {
+        // Regular group, box group, or a top group dragged out
+        allGroups.push(child);
+      }
+    });
+
+    const groupOrder = allGroups.map((group, index) => ({
+      name: group.dataset.groupName,
+      order: index
+    }));
+
+    await window.convexMutation("functions:updateGroupOrder", { groupOrder });
+    console.log('✅ Group order saved:', groupOrder.length, 'groups');
+    
+    // Crucial: Reload links to keep global 'links' array in sync with new orders
+    await loadLinks();
+  } catch (error) {
+    console.error('❌ Error saving group order:', error);
+  }
+}
+
+// Reload link icon from URL
+async function reloadLinkIcon(containerId, imgUrlInputId) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  
+  const firstInput = container.querySelector('.url-input');
+  const url = firstInput ? firstInput.value : '';
+  
+  if (!url) {
+    window.showNotification('Please enter a URL first', 'error');
+    return;
+  }
+
+  await fetchAndSetIcon(url, imgUrlInputId);
+}
+
+// Reload sidebar button icon from URL
+async function reloadSidebarIcon(urlInputId, imgUrlInputId) {
+  const url = document.getElementById(urlInputId).value;
+  
+  if (!url) {
+    window.showNotification('Please enter a URL first', 'error');
+    return;
+  }
+
+  await fetchAndSetIcon(url, imgUrlInputId);
+}
+
+// Shared logic to fetch and set icon
+async function fetchAndSetIcon(url, imgUrlInputId) {
+  const btn = document.querySelector(`.reload-icon-btn[onclick*="${imgUrlInputId}"]`);
+  try {
+    if (btn) btn.textContent = '⏳';
+
+    const urlObj = new URL(url);
+    const domain = urlObj.hostname.replace('www.', '');
+    let faviconUrl = `https://www.google.com/s2/favicons?domain=${domain}&sz=64`;
+
+    let foundSpecificIcon = false;
+    let iconToSet = null;
+
+    try {
+      const result = await window.convexClient.action("actions:fetchPageTitle", { url });
+      if (result.channelIcon) {
+        iconToSet = result.channelIcon;
+        foundSpecificIcon = true;
+      }
+    } catch (error) {
+      console.warn('Could not fetch icon from backend:', error);
+    }
+
+    // Always provide a fallback icon if no specific one is found
+    if (!foundSpecificIcon) {
+      const urlObj = new URL(url);
+      const domain = urlObj.hostname.replace('www.', '');
+      iconToSet = `https://www.google.com/s2/favicons?domain=${domain}&sz=64`;
+    }
+
+    const input = document.getElementById(imgUrlInputId);
+    if (input) {
+      input.value = iconToSet;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    if (foundSpecificIcon) {
+      window.showNotification('Specific icon found and loaded', 'success');
+    } else {
+      window.showNotification('Standard favicon loaded', 'success');
+    }
+  } catch (error) {
+    console.error('Error reloading icon:', error);
+    window.showNotification('Invalid URL format', 'error');
+  } finally {
+    if (btn) btn.textContent = '🔄';
+  }
+}
+
+// Make them global so onclick works
+window.reloadLinkIcon = reloadLinkIcon;
+window.reloadSidebarIcon = reloadSidebarIcon;
+
+// Folder chip green highlight when a path is set
+function updateFolderChipColor(pathInputId, chipId) {
+  const pathEl = document.getElementById(pathInputId);
+  const chipEl = document.getElementById(chipId);
+  if (!pathEl || !chipEl) return;
+  // chipEl is the <input> inside <label class="option-chip">, sibling of <span class="option-chip-body">
+  const body = chipEl.parentElement?.querySelector('.option-chip-body');
+  if (body) body.classList.toggle('has-path', pathEl.value.trim() !== '');
+}
+
+// Wire up live updates for both add and edit forms
+['link-folder-path', 'edit-link-folder-path'].forEach(pathId => {
+  const chipId = pathId === 'link-folder-path' ? 'link-folder-picker' : 'edit-link-folder-picker';
+  const el = document.getElementById(pathId);
+  if (el) el.addEventListener('input', () => updateFolderChipColor(pathId, chipId));
+});
+
+window.resetAllYouTubeTracking = async () => {
+  const btn = document.getElementById('reset-all-youtube-btn');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Resetting...';
+  }
+  try {
+    await window.convexMutation("functions:resetAllYouTubeTracking");
+    window.showNotification("YouTube tracking reset! Fresh baselines will be set on next check.", "success");
+    await loadLinks();
+    if (typeof loadSidebarButtons === 'function') {
+      await loadSidebarButtons();
+    }
+  } catch (error) {
+    console.error("Failed to reset YouTube tracking:", error);
+    window.showNotification("Failed to reset tracking", "error");
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = 'Reset YouTube Tracking (Fresh Count)';
+    }
+  }
+};
+
+window.refreshEnabledThumbnails = async () => {
+  const btn = document.getElementById('refresh-enabled-thumbnails-btn');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Refreshing... ⏳';
+  }
+  try {
+    const enabledLinks = links.filter(l => l.thumbnail_refresh_enabled && l.url);
+    const enabledSidebarButtons = (window.sidebarButtons || []).filter(b => b.thumbnail_refresh_enabled && b.url);
+
+    const total = enabledLinks.length + enabledSidebarButtons.length;
+    if (total === 0) {
+      window.showNotification("No items have thumbnail refresh enabled.", "warning");
+      return;
+    }
+
+    console.log(`🔄 Refreshing ${total} enabled thumbnails...`);
+    let successCount = 0;
+
+    const batchSize = 3;
+    const allItems = [
+      ...enabledLinks.map(l => ({ id: l._id, url: l.url, table: 'links' })),
+      ...enabledSidebarButtons.map(b => ({ id: b._id, url: b.url, table: 'sidebar_buttons' }))
+    ];
+
+    for (let i = 0; i < allItems.length; i += batchSize) {
+      const batch = allItems.slice(i, i + batchSize);
+      await Promise.all(batch.map(async item => {
+        try {
+          const urlObj = new URL(item.url);
+          const domain = urlObj.hostname.replace('www.', '');
+          
+          let iconToSet = null;
+          let foundSpecificIcon = false;
+
+          try {
+            const result = await window.convexClient.action("actions:fetchPageTitle", { url: item.url });
+            if (result.channelIcon) {
+              iconToSet = result.channelIcon;
+              foundSpecificIcon = true;
+            }
+          } catch (err) {
+            console.warn(`Could not fetch page title/icon for ${item.url}:`, err);
+          }
+
+          if (!foundSpecificIcon) {
+            iconToSet = `https://www.google.com/s2/favicons?domain=${domain}&sz=64`;
+          }
+
+          await window.convexMutation("functions:updateItemImage", {
+            id: item.id,
+            table: item.table,
+            img_src: iconToSet
+          });
+          successCount++;
+        } catch (err) {
+          console.error(`Error refreshing thumbnail for ${item.url}:`, err);
+        }
+      }));
+    }
+
+    window.showNotification(`Refreshed ${successCount} of ${total} thumbnails successfully!`, "success");
+    await loadLinks();
+    if (typeof loadSidebarButtons === 'function') {
+      await loadSidebarButtons();
+    }
+  } catch (error) {
+    console.error("Failed to refresh thumbnails:", error);
+    window.showNotification("Failed to refresh thumbnails", "error");
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = 'Refresh Enabled Thumbnails 🔄';
+    }
+  }
+};
+
