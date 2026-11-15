@@ -1,0 +1,7 @@
+node_modules/
+.convex/
+package-lock.json
+.env.local
+convex/_generated/
+__pycache__/
+*.pyc

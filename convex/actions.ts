@@ -1,0 +1,327 @@
+import { action } from "./_generated/server";
+import { v } from "convex/values";
+
+export const fetchPageTitle = action({
+  args: { url: v.string() },
+  handler: async (ctx, args) => {
+    const urlObj = new URL(args.url);
+    const domain = urlObj.hostname.replace('www.', '');
+    let oembedTitle: string | null = null;
+    let oembedThumbnail: string | null = null;
+    let title: string | null = null;
+    
+    try {
+      // 1. Try oEmbed for YouTube (best for titles and thumbnails)
+      if (domain.includes('youtube.com') || domain.includes('youtu.be')) {
+        try {
+          const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(args.url)}&format=json`;
+          const response = await fetch(oembedUrl);
+          if (response.ok) {
+            const data = await response.json();
+            oembedTitle = data.title || null;
+            oembedThumbnail = data.thumbnail_url || null;
+          }
+        } catch (e) {
+          console.warn('YouTube oEmbed fetch failed', e);
+        }
+      }
+
+      // 2. Fallback to direct fetch
+      // Normalize URL using URL constructor to handle all special characters correctly
+      let targetUrl = args.url.trim();
+      try {
+        const tempUrl = new URL(targetUrl);
+        targetUrl = tempUrl.href;
+      } catch (e) {
+        console.warn('URL normalization failed, using original:', targetUrl);
+      }
+      
+      let response;
+      try {
+        // Try with browser headers first
+        response = await fetch(targetUrl, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          }
+        });
+
+        // If we get a 400 or other error, try one more time WITHOUT special headers
+        // Some servers (like Facebook's edge) reject requests if headers look "suspicious"
+        if (!response.ok && (response.status === 400 || response.status === 403)) {
+          response = await fetch(targetUrl);
+        }
+      } catch (e) {
+        console.error('Fetch attempt failed:', e);
+        // Last ditch effort: try without headers if the whole fetch threw
+        response = await fetch(targetUrl);
+      }
+      
+      let html = '';
+      if (!response.ok) {
+        const errorBody = await response.text().catch(() => 'No body');
+        console.error(`Fetch failed with ${response.status}: ${errorBody.substring(0, 200)}`);
+        if ((domain.includes('youtube.com') || domain.includes('youtu.be')) && (oembedTitle || oembedThumbnail)) {
+          return {
+            title: oembedTitle || title || domain,
+            domain: domain,
+            channelIcon: oembedThumbnail,
+            youtubeChannelId: null
+          };
+        }
+        
+        // Don't throw for Facebook, allow fallback URL parsing to proceed
+        if (!domain.includes('facebook.com')) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        html = errorBody; // Use error body just in case it has some info
+      } else {
+        html = await response.text();
+      }
+      
+      // Extract title from HTML
+      const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+      title = titleMatch ? titleMatch[1].trim() : null;
+      
+      const ogImageMatch =
+        html.match(/<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']+)["']/i) ||
+        html.match(/<meta[^>]*name=["']twitter:image["'][^>]*content=["']([^"']+)["']/i);
+      const ogImage = ogImageMatch ? ogImageMatch[1].replace(/&amp;/g, '&') : null;
+      const isYouTubeChannelPage = args.url.includes('/@') || args.url.includes('/channel/') || args.url.includes('/c/') || args.url.includes('/user/');
+      const isYouTubeVideoPage = domain.includes('youtube.com') && !isYouTubeChannelPage;
+
+      let channelIcon = oembedThumbnail || (isYouTubeVideoPage ? ogImage : null);
+      let youtubeChannelId = null;
+
+      // 3. Specific icon extraction logic
+      
+      // YouTube Channel Icon & ID (if not handled by oEmbed)
+      if (domain.includes('youtube.com')) {
+        // Extract Icon
+        if (isYouTubeChannelPage) {
+          const iconMatch = html.match(/"avatar":\{"thumbnails":\[\{"url":"([^"]+)"/);
+          if (iconMatch) {
+            channelIcon = iconMatch[1].replace(/&amp;/g, '&');
+          } else if (!channelIcon && ogImage) {
+            channelIcon = ogImage;
+          }
+        }
+
+        if (!channelIcon && ogImage) {
+          channelIcon = ogImage;
+        }
+        
+        // Extract Channel ID
+        const channelIdMatch = html.match(/<meta itemprop="channelId" content="(UC[^"]+)">/i) || 
+                               html.match(/"channelId":"(UC[^"]+)"/) ||
+                               html.match(/"externalId":"(UC[^"]+)"/) ||
+                               html.match(/"browseId":"(UC[^"]+)"/) ||
+                               html.match(/https:\/\/www\.youtube\.com\/channel\/(UC[\w-]+)/) ||
+                               html.match(/channel_id=(UC[\w-]+)/);
+        if (channelIdMatch) {
+          youtubeChannelId = channelIdMatch[1];
+        }
+      }
+
+      if (!youtubeChannelId && domain.includes('youtu.be')) {
+        const channelIdMatch = html.match(/<meta itemprop="channelId" content="(UC[^"]+)">/i) || 
+                               html.match(/"channelId":"(UC[^"]+)"/) ||
+                               html.match(/"externalId":"(UC[^"]+)"/) ||
+                               html.match(/"browseId":"(UC[^"]+)"/);
+        if (channelIdMatch) {
+          youtubeChannelId = channelIdMatch[1];
+        }
+      }
+      
+      // GitHub Icon (Owner avatar)
+      if (!channelIcon && domain.includes('github.com')) {
+        const parts = urlObj.pathname.split('/').filter(p => p);
+        if (parts.length >= 1) {
+          channelIcon = `https://github.com/${parts[0]}.png`;
+        }
+      }
+
+      // Facebook specific handling (SVG, Profiles, and JSON patterns)
+      if (!channelIcon && domain.includes('facebook.com')) {
+        // 1. FIRST try to extract video thumbnails/images from HTML
+        const fbPatterns = [
+          // Meta tags as fallback for FB (often contains the video thumbnail)
+          /<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']+)["']/i,
+          /<meta[^>]*content=["']([^"']+)["'][^>]*property=["']og:image["']/i,
+          // SVG image tag (common for profile pics in newer FB UI)
+          /<image[^>]*xlink:href=["']([^"']+)["']/i,
+          /<image[^>]*href=["']([^"']+)["']/i,
+          // JSON patterns (common in script tags)
+          /"profile_pic":\{"uri":"([^"]+)"/,
+          /"group_icon":\{"uri":"([^"]+)"/,
+          /"image":\{"uri":"([^"]+)"/,
+          /"Thumbnail":\{"uri":"([^"]+)"/
+        ];
+
+        for (const pattern of fbPatterns) {
+          const match = html.match(pattern);
+          if (match && match[1]) {
+            const unescaped = match[1].replace(/\\/g, '').replace(/&amp;/g, '&');
+            if (!unescaped.includes('facebook.com/images/fb_icon')) {
+              channelIcon = unescaped;
+              break;
+            }
+          }
+        }
+
+        // 2. Fallback to HTML scraping regexes for profile ID
+        if (!channelIcon) {
+          const fbIdMatch = html.match(/fb:\/\/(?:profile|page|group)\/(\d+)/i) ||
+                            html.match(/fb:\/\/page\/\?id=(\d+)/i) ||
+                            html.match(/"target_id":"(\d+)"/i) ||
+                            html.match(/"entity_id":"(\d+)"/i);
+          if (fbIdMatch && fbIdMatch[1]) {
+            channelIcon = `https://graph.facebook.com/${fbIdMatch[1]}/picture?type=large`;
+          }
+        }
+
+        // 3. Fallback to URL identifier extraction if HTML yielded nothing
+        if (!channelIcon) {
+          const pathSegments = urlObj.pathname.split('/').filter(Boolean);
+          let fbIdentifier: string | null = null;
+          
+          if (urlObj.searchParams.has('id')) {
+            fbIdentifier = urlObj.searchParams.get('id');
+          } else if (pathSegments[0] === 'people' && pathSegments[2]) {
+            fbIdentifier = pathSegments[2];
+          } else if (pathSegments[0] === 'groups' && pathSegments[1]) {
+            fbIdentifier = pathSegments[1];
+          } else if (pathSegments[0] && !['login', 'r.php', 'sharer', 'dialog', 'plugins', 'share', 'videos', 'watch', 'reel', 'reels', 'story.php'].includes(pathSegments[0].toLowerCase())) {
+            fbIdentifier = pathSegments[0];
+          }
+
+          if (fbIdentifier) {
+            channelIcon = `https://graph.facebook.com/${fbIdentifier}/picture?type=large`;
+          }
+        }
+      }
+
+      // Chrome Web Store specific handling (Extract from meta tags)
+      if (!channelIcon && (domain.includes('chromewebstore.google.com') || domain.includes('chrome.google.com/webstore'))) {
+        const storePatterns = [
+          /<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']+)["']/i,
+          /<meta[^>]*content=["']([^"']+)["'][^>]*property=["']og:image["']/i,
+          /<meta[^>]*name=["']twitter:image["'][^>]*content=["']([^"']+)["']/i
+        ];
+        for (const pattern of storePatterns) {
+          const match = html.match(pattern);
+          if (match && match[1]) {
+            channelIcon = match[1].replace(/&amp;/g, '&');
+            break;
+          }
+        }
+      }
+
+      // Google specifically (search, main page, and subdomains like Gmail, Colab, etc.)
+      if (!channelIcon && domain.includes('google.')) {
+        // 1. Hardcoded mappings for services that often redirect to login pages (like Gmail)
+        const googleServiceIcons: Record<string, string> = {
+          'mail.google.com': 'https://ssl.gstatic.com/ui/v1/icons/mail/images/favicon5.ico',
+          'drive.google.com': 'https://ssl.gstatic.com/images/branding/product/1x/drive_2020q4_48dp.png',
+          'calendar.google.com': 'https://ssl.gstatic.com/calendar/images/favicon_v2014_15.ico',
+          'photos.google.com': 'https://ssl.gstatic.com/social/white/br/p-v1.png',
+          'docs.google.com': 'https://ssl.gstatic.com/docs/documents/images/kix-favicon7.ico',
+          'sheets.google.com': 'https://ssl.gstatic.com/docs/spreadsheets/favicon3.ico',
+          'slides.google.com': 'https://ssl.gstatic.com/docs/presentations/images/favicon5.ico',
+          'meet.google.com': 'https://ssl.gstatic.com/s2/favicons?domain=meet.google.com&sz=128'
+        };
+
+        if (googleServiceIcons[domain]) {
+          channelIcon = googleServiceIcons[domain];
+        }
+
+        // 2. Try to find specific icon in HTML meta/link tags (works for public pages like Colab)
+        if (!channelIcon) {
+          const googlePatterns = [
+            /<link[^>]*rel=["'](?:shortcut )?icon["'][^>]*href=["']([^"']+)["']/i,
+            /<link[^>]*href=["']([^"']+)["'][^>]*rel=["'](?:shortcut )?icon["']/i,
+            /<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']+)["']/i
+          ];
+
+          for (const pattern of googlePatterns) {
+            const match = html.match(pattern);
+            if (match && match[1]) {
+              let iconUrl = match[1].replace(/&amp;/g, '&');
+              // Handle relative URLs
+              if (iconUrl.startsWith('//')) iconUrl = 'https:' + iconUrl;
+              else if (iconUrl.startsWith('/')) iconUrl = `https://${domain}${iconUrl}`;
+              else if (!iconUrl.startsWith('http')) iconUrl = `https://${domain}/${iconUrl}`;
+              channelIcon = iconUrl;
+              break;
+            }
+          }
+        }
+
+        // 3. Fallback to favicon service with specific subdomain
+        if (!channelIcon) {
+          channelIcon = `https://www.google.com/s2/favicons?domain=${domain}&sz=128`;
+        }
+      }
+
+      return {
+        title: oembedTitle || title || domain,
+        domain: domain,
+        channelIcon: channelIcon,
+        youtubeChannelId: youtubeChannelId
+      };
+    } catch (error) {
+      console.error('Fetch error:', error);
+      if (domain.includes('youtube.com') || domain.includes('youtu.be')) {
+        return {
+          title: oembedTitle || domain,
+          domain: domain,
+          channelIcon: oembedThumbnail,
+          youtubeChannelId: null
+        };
+      }
+      return {
+        title: domain,
+        domain: domain,
+        channelIcon: null,
+        youtubeChannelId: null
+      };
+    }
+  },
+});
+
+export const checkYouTubeUpdates = action({
+  args: { channelId: v.string(), lastVideoId: v.optional(v.string()) },
+  handler: async (ctx, args) => {
+    try {
+      // Fetch the channel's XML RSS feed instead of web scraping
+      const rssUrl = `https://www.youtube.com/feeds/videos.xml?channel_id=${args.channelId}`;
+      const response = await fetch(rssUrl);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+      const xml = await response.text();
+      
+      // Extract video IDs from standard <yt:videoId> XML elements
+      const matches = [...xml.matchAll(/<yt:videoId>([a-zA-Z0-9_-]{11})<\/yt:videoId>/g)];
+      const videoIds = matches.map(match => match[1]);
+
+      if (videoIds.length === 0) return { count: 0, latestVideoId: args.lastVideoId || null };
+
+      const latestVideoId = videoIds[0];
+
+      if (!args.lastVideoId) return { count: 0, latestVideoId };
+      if (latestVideoId === args.lastVideoId) return { count: 0, latestVideoId };
+
+      const lastIndex = videoIds.indexOf(args.lastVideoId);
+      
+      // If the last tracked video is no longer in the feed (pushed off the 15-item feed limit or deleted),
+      // cap the notification count to 1 as a safety measure to prevent massive false positive spikes.
+      const count = lastIndex === -1 ? 1 : lastIndex;
+
+      return { count, latestVideoId };
+    } catch (error) {
+      console.error('YouTube update check failed:', error);
+      return { count: 0, latestVideoId: args.lastVideoId || null };
+    }
+  },
+});
+
