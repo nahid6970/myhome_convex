@@ -1085,7 +1085,7 @@ function renderLinks() {
     fab.style.height = '38px';
     fab.style.borderRadius = '50%';
     fab.style.background = 'transparent';
-    fab.style.color = '#fff';
+    fab.style.color = '#ffca66';
     fab.style.border = 'none';
     fab.style.fontSize = '28px';
     fab.style.fontWeight = '400';
@@ -1103,11 +1103,11 @@ function renderLinks() {
       showAddLinkPopup();
     };
     fab.onmouseenter = () => {
-      fab.style.color = '#4CAF50';
+      fab.style.color = '#ffe0a3';
       fab.style.transform = 'scale(1.1)';
     };
     fab.onmouseleave = () => {
-      fab.style.color = '#fff';
+      fab.style.color = '#ffca66';
       fab.style.transform = 'scale(1)';
     };
     document.body.appendChild(fab);
@@ -3144,7 +3144,7 @@ document.addEventListener('DOMContentLoaded', () => {
       emergencyFab.style.height = '38px';
       emergencyFab.style.borderRadius = '50%';
       emergencyFab.style.background = 'transparent';
-      emergencyFab.style.color = '#fff';
+      emergencyFab.style.color = '#ffca66';
       emergencyFab.style.border = 'none';
       emergencyFab.style.fontSize = '28px';
       emergencyFab.style.fontWeight = '400';
@@ -3159,11 +3159,11 @@ document.addEventListener('DOMContentLoaded', () => {
       emergencyFab.style.justifyContent = 'center';
       emergencyFab.onclick = () => showAddLinkPopup();
       emergencyFab.onmouseenter = () => {
-        emergencyFab.style.color = '#4CAF50';
+        emergencyFab.style.color = '#ffe0a3';
         emergencyFab.style.transform = 'scale(1.1)';
       };
       emergencyFab.onmouseleave = () => {
-        emergencyFab.style.color = '#fff';
+        emergencyFab.style.color = '#ffca66';
         emergencyFab.style.transform = 'scale(1)';
       };
       document.body.appendChild(emergencyFab);
